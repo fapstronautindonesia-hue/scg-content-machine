@@ -4,3 +4,4 @@ psycopg[binary]
 redis
 requests
 httpx
+openai
