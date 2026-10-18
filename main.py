@@ -8,9 +8,13 @@ from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 
 
+# =========================================================
+# APP
+# =========================================================
+
 app = FastAPI(
     title="SCG Content Machine",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 
@@ -21,6 +25,10 @@ app = FastAPI(
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
+
+# =========================================================
+# TELEGRAM HELPERS
+# =========================================================
 
 def telegram_api(method: str, payload: dict):
     if not TELEGRAM_BOT_TOKEN:
@@ -51,6 +59,14 @@ def send_message(chat_id, text, reply_markup=None):
     return telegram_api("sendMessage", payload)
 
 
+def answer_callback_query(callback_query_id):
+    payload = {
+        "callback_query_id": callback_query_id
+    }
+
+    return telegram_api("answerCallbackQuery", payload)
+
+
 # =========================================================
 # ROOT
 # =========================================================
@@ -60,7 +76,7 @@ def root():
     return {
         "system": "SCG Content Machine",
         "status": "ONLINE",
-        "version": "1.1.0"
+        "version": "1.2.0"
     }
 
 
@@ -73,7 +89,7 @@ def health():
     database_status = "disconnected"
     redis_status = "disconnected"
 
-    # Check PostgreSQL
+    # PostgreSQL
     try:
         database_url = os.getenv("DATABASE_URL")
 
@@ -94,7 +110,7 @@ def health():
     except Exception:
         database_status = "disconnected"
 
-    # Check Redis
+    # Redis
     try:
         redis_url = os.getenv("REDIS_URL")
 
@@ -122,7 +138,7 @@ def health():
     payload = {
         "status": "healthy" if healthy else "unhealthy",
         "service": "content-machine",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "database": database_status,
         "redis": redis_status
     }
@@ -142,7 +158,11 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(default=None)
 ):
-    # Security guard
+
+    # -----------------------------------------------------
+    # SECURITY
+    # -----------------------------------------------------
+
     if not TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(
             status_code=500,
@@ -157,6 +177,188 @@ async def telegram_webhook(
 
     update = await request.json()
 
+    print("TELEGRAM UPDATE:", update)
+
+
+    # =====================================================
+    # CALLBACK QUERY / BUTTON
+    # =====================================================
+
+    callback_query = update.get("callback_query")
+
+    if callback_query:
+
+        callback_id = callback_query.get("id")
+        callback_data = callback_query.get("data", "")
+
+        callback_message = callback_query.get("message", {})
+        callback_chat = callback_message.get("chat", {})
+        callback_chat_id = callback_chat.get("id")
+
+        if callback_id:
+            answer_callback_query(callback_id)
+
+
+        # -------------------------------------------------
+        # BRAND: SCG
+        # -------------------------------------------------
+
+        if callback_data == "brand:SCG":
+
+            format_keyboard = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Feed",
+                            "callback_data": "format:SCG:FEED"
+                        },
+                        {
+                            "text": "Carousel",
+                            "callback_data": "format:SCG:CAROUSEL"
+                        }
+                    ],
+                    [
+                        {
+                            "text": "Story",
+                            "callback_data": "format:SCG:STORY"
+                        },
+                        {
+                            "text": "Feed + Story",
+                            "callback_data": "format:SCG:FEED_STORY"
+                        }
+                    ]
+                ]
+            }
+
+            send_message(
+                callback_chat_id,
+                "✅ Brand dipilih: SCG\n\n"
+                "Sekarang pilih format konten:",
+                format_keyboard
+            )
+
+
+        # -------------------------------------------------
+        # BRAND: ILMI
+        # -------------------------------------------------
+
+        elif callback_data == "brand:ILMI":
+
+            format_keyboard = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Feed",
+                            "callback_data": "format:ILMI:FEED"
+                        },
+                        {
+                            "text": "Carousel",
+                            "callback_data": "format:ILMI:CAROUSEL"
+                        }
+                    ],
+                    [
+                        {
+                            "text": "Story",
+                            "callback_data": "format:ILMI:STORY"
+                        },
+                        {
+                            "text": "Feed + Story",
+                            "callback_data": "format:ILMI:FEED_STORY"
+                        }
+                    ]
+                ]
+            }
+
+            send_message(
+                callback_chat_id,
+                "✅ Brand dipilih: ILMI\n\n"
+                "Sekarang pilih format konten:",
+                format_keyboard
+            )
+
+
+        # -------------------------------------------------
+        # FORMAT SELECTED
+        # -------------------------------------------------
+
+        elif callback_data.startswith("format:"):
+
+            parts = callback_data.split(":")
+
+            if len(parts) == 3:
+
+                brand = parts[1]
+                content_format = parts[2]
+
+                objective_keyboard = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "🤖 AI Otomatis",
+                                "callback_data": f"objective:{brand}:{content_format}:AUTO"
+                            }
+                        ],
+                        [
+                            {
+                                "text": "📚 Edukasi",
+                                "callback_data": f"objective:{brand}:{content_format}:EDUKASI"
+                            },
+                            {
+                                "text": "✨ Showcase",
+                                "callback_data": f"objective:{brand}:{content_format}:SHOWCASE"
+                            }
+                        ],
+                        [
+                            {
+                                "text": "🔥 Promo",
+                                "callback_data": f"objective:{brand}:{content_format}:PROMO"
+                            },
+                            {
+                                "text": "💬 Testimoni",
+                                "callback_data": f"objective:{brand}:{content_format}:TESTIMONI"
+                            }
+                        ]
+                    ]
+                }
+
+                send_message(
+                    callback_chat_id,
+                    f"✅ Format dipilih: {content_format}\n\n"
+                    "Sekarang pilih tujuan konten:",
+                    objective_keyboard
+                )
+
+
+        # -------------------------------------------------
+        # OBJECTIVE SELECTED
+        # -------------------------------------------------
+
+        elif callback_data.startswith("objective:"):
+
+            parts = callback_data.split(":")
+
+            if len(parts) == 4:
+
+                brand = parts[1]
+                content_format = parts[2]
+                objective = parts[3]
+
+                send_message(
+                    callback_chat_id,
+                    "✅ Brief konten berhasil dibuat.\n\n"
+                    f"🏷 Brand: {brand}\n"
+                    f"🖼 Format: {content_format}\n"
+                    f"🎯 Objective: {objective}\n\n"
+                    "📸 Sekarang kirim foto yang ingin dibuatkan konten."
+                )
+
+        return {"ok": True}
+
+
+    # =====================================================
+    # NORMAL MESSAGE
+    # =====================================================
+
     message = update.get("message")
 
     if not message:
@@ -170,13 +372,14 @@ async def telegram_webhook(
 
     text = message.get("text", "")
 
+
     # -----------------------------------------------------
     # /start
     # -----------------------------------------------------
 
     if text == "/start":
 
-        keyboard = {
+        brand_keyboard = {
             "inline_keyboard": [
                 [
                     {
@@ -195,10 +398,15 @@ async def telegram_webhook(
             chat_id,
             "👋 Selamat datang di SCG Content Machine.\n\n"
             "Pilih brand yang ingin dibuatkan konten:",
-            keyboard
+            brand_keyboard
         )
 
         return {"ok": True}
+
+
+    # -----------------------------------------------------
+    # DEFAULT
+    # -----------------------------------------------------
 
     send_message(
         chat_id,
@@ -206,30 +414,3 @@ async def telegram_webhook(
     )
 
     return {"ok": True}
-@app.post("/telegram/webhook")
-async def telegram_webhook(
-    request: Request,
-    x_telegram_bot_api_secret_token: str | None = Header(default=None)
-):
-    webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
-
-    if not webhook_secret:
-        raise HTTPException(
-            status_code=500,
-            detail="TELEGRAM_WEBHOOK_SECRET is missing"
-        )
-
-    if x_telegram_bot_api_secret_token != webhook_secret:
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid webhook secret"
-        )
-
-    update = await request.json()
-
-    print("TELEGRAM UPDATE:", update)
-
-    return {
-        "ok": True,
-        "received": True
-    }
