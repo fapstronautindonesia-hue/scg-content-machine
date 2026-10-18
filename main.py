@@ -1,139 +1,114 @@
 import os
 import json
-import uuid
+import time
+import base64
+import logging
+from typing import Any, Dict
 
 import psycopg
 import redis
 import requests
-
-from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import JSONResponse
+from openai import OpenAI
 
 
-# =========================================================
-# APP
-# =========================================================
-
-app = FastAPI(
-    title="SCG Content Machine",
-    version="1.4.0"
-)
+# ============================================================
+# SCG CONTENT MACHINE
+# V1.4.1 — AI VISION ANALYZER
+# GPT-6 ASTRA / MAX REASONING
+# ============================================================
 
 
-# =========================================================
+# ============================================================
 # CONFIG
-# =========================================================
+# ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-SESSION_TTL = 3600
+OPENAI_VISION_MODEL = os.getenv(
+    "OPENAI_VISION_MODEL",
+    "gpt-6-astra"
+)
 
-AI_ANALYSIS_QUEUE = os.getenv(
+OPENAI_REASONING_EFFORT = os.getenv(
+    "OPENAI_REASONING_EFFORT",
+    "max"
+)
+
+QUEUE_NAME = os.getenv(
     "AI_ANALYSIS_QUEUE",
     "contentmachine:analysis_queue"
 )
 
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+DOWNLOAD_TIMEOUT = 30
+TELEGRAM_TIMEOUT = 20
 
-# =========================================================
-# REDIS
-# =========================================================
 
-def get_redis():
-    if not REDIS_URL:
-        raise RuntimeError("REDIS_URL is missing")
+# ============================================================
+# LOGGING
+# ============================================================
 
-    return redis.from_url(
-        REDIS_URL,
-        decode_responses=True,
-        socket_connect_timeout=5,
-        socket_timeout=5
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger(
+    "content-machine-ai-worker"
+)
+
+
+# ============================================================
+# ENV VALIDATION
+# ============================================================
+
+required_env = {
+    "DATABASE_URL": DATABASE_URL,
+    "REDIS_URL": REDIS_URL,
+    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+    "OPENAI_API_KEY": OPENAI_API_KEY,
+}
+
+missing_env = [
+    name
+    for name, value in required_env.items()
+    if not value
+]
+
+if missing_env:
+    raise RuntimeError(
+        "Missing required environment variables: "
+        + ", ".join(missing_env)
     )
 
 
-# =========================================================
-# SESSION
-# =========================================================
+# ============================================================
+# CLIENTS
+# ============================================================
 
-def session_key(chat_id):
-    return f"content_session:{chat_id}"
+redis_client = redis.Redis.from_url(
+    REDIS_URL,
+    decode_responses=True,
+    socket_connect_timeout=5,
+    socket_timeout=35
+)
 
-
-def save_session(chat_id, data):
-    client = get_redis()
-
-    client.setex(
-        session_key(chat_id),
-        SESSION_TTL,
-        json.dumps(data)
-    )
+openai_client = OpenAI(
+    api_key=OPENAI_API_KEY
+)
 
 
-def get_session(chat_id):
-    client = get_redis()
-
-    raw = client.get(session_key(chat_id))
-
-    if not raw:
-        return None
-
-    return json.loads(raw)
-
-
-def delete_session(chat_id):
-    client = get_redis()
-    client.delete(session_key(chat_id))
-
-
-# =========================================================
-# AI ANALYSIS QUEUE
-# =========================================================
-
-def enqueue_analysis(
-    job_id,
-    chat_id,
-    file_path,
-    brand,
-    content_format,
-    objective,
-    mime_type="image/jpeg"
-):
-    """
-    Masukkan task ke Redis.
-
-    Webhook TIDAK menjalankan AI secara langsung.
-    Worker V1.4 akan mengambil task ini secara asynchronous.
-    """
-
-    client = get_redis()
-
-    task = {
-        "job_id": str(job_id),
-        "chat_id": int(chat_id),
-        "file_path": file_path,
-        "brand": brand,
-        "format": content_format,
-        "objective": objective,
-        "mime_type": mime_type
-    }
-
-    client.rpush(
-        AI_ANALYSIS_QUEUE,
-        json.dumps(task)
-    )
-
-    return task
-
-
-# =========================================================
+# ============================================================
 # TELEGRAM HELPERS
-# =========================================================
+# ============================================================
 
-def telegram_api(method: str, payload: dict):
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+def telegram_api(
+    method: str,
+    payload: Dict[str, Any]
+) -> Dict[str, Any]:
 
     url = (
         f"https://api.telegram.org/"
@@ -143,7 +118,7 @@ def telegram_api(method: str, payload: dict):
     response = requests.post(
         url,
         json=payload,
-        timeout=15
+        timeout=TELEGRAM_TIMEOUT
     )
 
     response.raise_for_status()
@@ -158,71 +133,537 @@ def telegram_api(method: str, payload: dict):
     return data
 
 
-def send_message(chat_id, text, reply_markup=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text
-    }
+def send_message(
+    chat_id: int,
+    text: str
+) -> None:
 
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
-    return telegram_api(
-        "sendMessage",
-        payload
-    )
-
-
-def answer_callback_query(callback_query_id):
-    return telegram_api(
-        "answerCallbackQuery",
-        {
-            "callback_query_id": callback_query_id
-        }
-    )
-
-
-def get_telegram_file(file_id):
-    response = telegram_api(
-        "getFile",
-        {
-            "file_id": file_id
-        }
-    )
-
-    result = response.get("result")
-
-    if not result:
-        raise RuntimeError(
-            "Telegram getFile returned no result"
+    try:
+        telegram_api(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text
+            }
         )
 
-    return result
+    except Exception:
+        # Telegram notification failure must NOT
+        # roll back a completed AI analysis.
+        logger.exception(
+            "Telegram send failed chat_id=%s",
+            chat_id
+        )
 
 
-# =========================================================
-# DATABASE
-# =========================================================
+# ============================================================
+# TELEGRAM IMAGE DOWNLOAD
+# ============================================================
 
-def create_job_and_asset(
-    chat_id,
-    message_id,
-    brand,
-    content_format,
-    objective,
-    telegram_file_id,
-    telegram_file_unique_id,
-    telegram_file_path
-):
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing")
+def download_telegram_image(
+    file_path: str
+) -> bytes:
 
-    job_id = uuid.uuid4()
-    asset_id = uuid.uuid4()
+    if not file_path:
+        raise ValueError(
+            "Telegram file_path is empty"
+        )
 
-    external_id = (
-        f"telegram:{chat_id}:{message_id}"
+    # Never log this URL because it contains
+    # the Telegram bot token.
+    url = (
+        f"https://api.telegram.org/file/"
+        f"bot{TELEGRAM_BOT_TOKEN}/{file_path}"
     )
+
+    response = requests.get(
+        url,
+        timeout=DOWNLOAD_TIMEOUT
+    )
+
+    response.raise_for_status()
+
+    image_bytes = response.content
+
+    if not image_bytes:
+        raise ValueError(
+            "Downloaded image is empty"
+        )
+
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise ValueError(
+            "Image exceeds worker size limit"
+        )
+
+    return image_bytes
+
+
+# ============================================================
+# MIME DETECTION
+# ============================================================
+
+def detect_mime_type(
+    image_bytes: bytes,
+    fallback: str = "image/jpeg"
+) -> str:
+
+    if image_bytes.startswith(
+        b"\xff\xd8\xff"
+    ):
+        return "image/jpeg"
+
+    if image_bytes.startswith(
+        b"\x89PNG\r\n\x1a\n"
+    ):
+        return "image/png"
+
+    if (
+        image_bytes.startswith(b"RIFF")
+        and b"WEBP" in image_bytes[:16]
+    ):
+        return "image/webp"
+
+    return fallback or "image/jpeg"
+
+
+# ============================================================
+# BRAND CONTEXT
+# ============================================================
+
+def brand_context(
+    brand: str
+) -> str:
+
+    brand = (
+        brand or ""
+    ).upper()
+
+    if brand == "SCG":
+
+        return """
+BRAND: SERBACANTIK GORDEN / SCG
+
+BUSINESS:
+Custom gorden dan instalasi.
+
+TARGET:
+Rumah pribadi, terutama wilayah Makassar,
+Gowa, dan Maros.
+
+BRAND CHARACTER:
+Premium, elegant, warm, editorial interior,
+rapi, terpercaya, dan soft selling.
+
+PRODUCT CONTEXT MAY INCLUDE:
+- blackout curtain
+- vitrase / sheer
+- custom curtain
+- roller blind
+- venetian blind
+- curtain accessories
+
+VISUAL PRIORITY:
+- hasil pemasangan
+- kerapian jahitan/pemasangan yang terlihat
+- perpaduan curtain dan vitrase
+- warna dengan interior
+- transformasi ruangan
+- selling point yang benar-benar terlihat
+- kekurangan foto yang mengurangi kualitas konten
+"""
+
+    if brand == "ILMI":
+
+        return """
+BRAND: ILMI GORDEN
+
+POSITIONING:
+Toko gorden yang mudah dijangkau.
+
+CHANNEL CHARACTER:
+Marketplace dan social commerce.
+
+BRAND CHARACTER:
+Modern, clean, trusted, practical,
+product-first.
+
+VISUAL PRIORITY:
+- produk
+- warna
+- motif
+- fungsi yang dapat disimpulkan secara aman
+- kejelasan produk
+- daya jual marketplace
+- kekurangan visual
+"""
+
+    return """
+Analisis sebagai aset visual bisnis
+gorden/interior secara objektif.
+"""
+
+
+# ============================================================
+# ANALYSIS PROMPT
+# ============================================================
+
+def build_analysis_prompt(
+    brand: str,
+    content_format: str,
+    objective: str
+) -> str:
+
+    return f"""
+Kamu adalah Senior Creative Director,
+Visual Merchandiser, dan Content Strategist
+untuk bisnis gorden.
+
+{brand_context(brand)}
+
+CONTENT BRIEF:
+Brand: {brand}
+Format: {content_format}
+Objective: {objective}
+
+TUGAS UTAMA:
+
+Analisis foto secara teliti untuk menentukan
+bagaimana aset ini sebaiknya digunakan sebagai
+materi konten.
+
+Gunakan HANYA informasi yang benar-benar
+terlihat atau dapat disimpulkan secara aman
+dari gambar.
+
+DILARANG MENGARANG:
+- harga
+- ukuran
+- lokasi customer
+- nama customer
+- merek kain
+- persentase blackout
+- bahan kain spesifik
+- spesifikasi teknis yang tidak terlihat
+
+Jika tidak yakin, gunakan null.
+
+PERHATIKAN SECARA KHUSUS:
+
+1. Produk utama yang terlihat.
+2. Jenis ruangan/scene.
+3. Warna dominan.
+4. Gaya interior bila cukup jelas.
+5. Komposisi foto.
+6. Sudut pengambilan gambar.
+7. Pencahayaan.
+8. Distraksi visual.
+9. Proporsi ceiling/wall/floor.
+10. Seberapa jelas produk menjadi focal point.
+11. Kerapian hasil pemasangan yang terlihat.
+12. Potensi selling point.
+13. Kesesuaian dengan objective user.
+14. Kesesuaian dengan format konten.
+15. Apakah foto layak dipublikasikan.
+
+SCORING:
+
+1-3:
+Tidak layak digunakan tanpa pengambilan
+foto ulang.
+
+4-5:
+Bisa digunakan tetapi membutuhkan
+perbaikan signifikan.
+
+6-7:
+Layak digunakan sebagai konten.
+
+8-9:
+Sangat kuat untuk konten.
+
+10:
+Kualitas visual sangat kuat dan hampir
+siap publikasi tanpa koreksi berarti.
+
+RECOMMENDED ANGLE:
+
+Pilih SATU angle utama paling kuat:
+
+- showcase
+- edukasi
+- promo
+- product_detail
+- transformation
+- trust
+- inspiration
+
+Jika objective user kurang cocok dengan foto,
+tetap catat objective user tetapi pilih angle
+visual yang menurutmu paling kuat.
+
+CONTENT IDEA:
+
+Buat satu ide konten yang konkret.
+Jangan generik.
+
+Contoh buruk:
+"Posting hasil pemasangan gorden."
+
+Contoh lebih baik:
+"Showcase bagaimana kombinasi gorden utama
+berwarna netral dan vitrase putih membuat
+jendela terlihat lebih rapi dan berlapis."
+
+OUTPUT:
+
+Kembalikan JSON VALID SAJA.
+
+Tidak boleh menggunakan markdown.
+Tidak boleh menggunakan ```json.
+Tidak boleh menambahkan kalimat sebelum
+atau sesudah JSON.
+
+Gunakan struktur berikut:
+
+{{
+  "scene": "string atau null",
+  "product": "string atau null",
+  "curtain_style": "string atau null",
+
+  "dominant_colors": [
+    "string"
+  ],
+
+  "room_style": "string atau null",
+
+  "visual_quality_score": 1,
+
+  "visual_strengths": [
+    "string"
+  ],
+
+  "visual_issues": [
+    "string"
+  ],
+
+  "selling_points": [
+    "string"
+  ],
+
+  "recommended_angle": "string",
+
+  "content_idea": "string",
+
+  "usable": true
+}}
+
+Seluruh isi JSON harus menggunakan
+Bahasa Indonesia.
+"""
+
+
+# ============================================================
+# CLEAN MODEL OUTPUT
+# ============================================================
+
+def clean_json_output(
+    output_text: str
+) -> Dict[str, Any]:
+
+    if not output_text:
+        raise RuntimeError(
+            "OpenAI returned empty output"
+        )
+
+    cleaned = output_text.strip()
+
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+
+    cleaned = cleaned.strip()
+
+    try:
+        data = json.loads(cleaned)
+
+    except json.JSONDecodeError as exc:
+
+        logger.error(
+            "Invalid JSON returned by AI"
+        )
+
+        raise RuntimeError(
+            "OpenAI output is not valid JSON"
+        ) from exc
+
+    if not isinstance(
+        data,
+        dict
+    ):
+        raise RuntimeError(
+            "AI output must be a JSON object"
+        )
+
+    return data
+
+
+# ============================================================
+# USAGE EXTRACTION
+# ============================================================
+
+def extract_usage(
+    response
+) -> Dict[str, int]:
+
+    usage = getattr(
+        response,
+        "usage",
+        None
+    )
+
+    if not usage:
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0
+        }
+
+    return {
+        "input_tokens": int(
+            getattr(
+                usage,
+                "input_tokens",
+                0
+            ) or 0
+        ),
+
+        "output_tokens": int(
+            getattr(
+                usage,
+                "output_tokens",
+                0
+            ) or 0
+        ),
+
+        "total_tokens": int(
+            getattr(
+                usage,
+                "total_tokens",
+                0
+            ) or 0
+        )
+    }
+
+
+# ============================================================
+# OPENAI VISION
+# ============================================================
+
+def analyze_image(
+    image_bytes: bytes,
+    mime_type: str,
+    brand: str,
+    content_format: str,
+    objective: str
+) -> Dict[str, Any]:
+
+    encoded_image = base64.b64encode(
+        image_bytes
+    ).decode("utf-8")
+
+    data_url = (
+        f"data:{mime_type};base64,"
+        f"{encoded_image}"
+    )
+
+    prompt = build_analysis_prompt(
+        brand=brand,
+        content_format=content_format,
+        objective=objective
+    )
+
+    logger.info(
+        "Calling OpenAI model=%s effort=%s",
+        OPENAI_VISION_MODEL,
+        OPENAI_REASONING_EFFORT
+    )
+
+    response = (
+        openai_client.responses.create(
+            model=OPENAI_VISION_MODEL,
+
+            reasoning={
+                "effort":
+                    OPENAI_REASONING_EFFORT
+            },
+
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type":
+                                "input_text",
+                            "text":
+                                prompt
+                        },
+                        {
+                            "type":
+                                "input_image",
+                            "image_url":
+                                data_url,
+                            "detail":
+                                "high"
+                        }
+                    ]
+                }
+            ]
+        )
+    )
+
+    analysis = clean_json_output(
+        response.output_text
+    )
+
+    usage = extract_usage(
+        response
+    )
+
+    return {
+        "analysis":
+            analysis,
+
+        "response_id":
+            getattr(
+                response,
+                "id",
+                None
+            ),
+
+        "model":
+            getattr(
+                response,
+                "model",
+                OPENAI_VISION_MODEL
+            ),
+
+        "usage":
+            usage
+    }
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def analysis_exists(
+    job_id: str
+) -> bool:
 
     with psycopg.connect(
         DATABASE_URL,
@@ -231,850 +672,579 @@ def create_job_and_asset(
 
         with conn.cursor() as cur:
 
-            # -------------------------------------------------
-            # CREATE JOB
-            # -------------------------------------------------
-
             cur.execute(
                 """
-                INSERT INTO jobs (
-                    id,
-                    source,
-                    external_id,
-                    brand,
-                    format,
-                    objective,
-                    status,
-                    requested_by
-                )
-                VALUES (
-                    %s,
-                    'telegram',
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    'RECEIVED',
-                    %s
-                )
-                ON CONFLICT DO NOTHING
-                RETURNING id
+                SELECT 1
+                FROM analyses
+                WHERE job_id = %s
+                LIMIT 1
                 """,
-                (
-                    job_id,
-                    external_id,
-                    brand,
-                    content_format,
-                    objective,
-                    str(chat_id)
-                )
+                (job_id,)
             )
 
-            inserted_job = cur.fetchone()
-
-            # -------------------------------------------------
-            # DUPLICATE PROTECTION
-            # -------------------------------------------------
-
-            if not inserted_job:
-
-                cur.execute(
-                    """
-                    SELECT id
-                    FROM jobs
-                    WHERE source = 'telegram'
-                    AND external_id = %s
-                    LIMIT 1
-                    """,
-                    (external_id,)
-                )
-
-                existing_job = cur.fetchone()
-
-                if not existing_job:
-                    raise RuntimeError(
-                        "Duplicate detected but "
-                        "existing job not found"
-                    )
-
-                return str(existing_job[0]), False
-
-            # -------------------------------------------------
-            # CREATE ASSET
-            # -------------------------------------------------
-
-            metadata = {
-                "telegram_file_id":
-                    telegram_file_id,
-                "telegram_file_unique_id":
-                    telegram_file_unique_id,
-                "telegram_file_path":
-                    telegram_file_path,
-                "telegram_chat_id":
-                    chat_id,
-                "telegram_message_id":
-                    message_id
-            }
-
-            original_filename = (
-                telegram_file_path.split("/")[-1]
-                if telegram_file_path
-                else None
+            return (
+                cur.fetchone()
+                is not None
             )
+
+
+def save_analysis(
+    job_id: str,
+    model: str,
+    analysis: Dict[str, Any]
+) -> None:
+
+    with psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=5
+    ) as conn:
+
+        with conn.cursor() as cur:
 
             cur.execute(
                 """
-                INSERT INTO assets (
-                    id,
+                INSERT INTO analyses (
                     job_id,
-                    asset_type,
-                    storage_provider,
-                    storage_key,
-                    original_filename,
-                    mime_type,
-                    metadata
+                    model,
+                    analysis
                 )
                 VALUES (
-                    %s,
-                    %s,
-                    'IMAGE',
-                    'telegram',
-                    %s,
                     %s,
                     %s,
                     %s::jsonb
                 )
                 """,
                 (
-                    asset_id,
                     job_id,
-                    telegram_file_path,
-                    original_filename,
-                    "image/jpeg",
-                    json.dumps(metadata)
+                    model,
+                    json.dumps(
+                        analysis,
+                        ensure_ascii=False
+                    )
                 )
             )
 
         conn.commit()
 
-    return str(job_id), True
 
+# ============================================================
+# TELEGRAM RESULT FORMATTER
+# ============================================================
 
-# =========================================================
-# ROOT
-# =========================================================
+def format_analysis_message(
+    analysis: Dict[str, Any],
+    content_format: str
+) -> str:
 
-@app.get("/")
-def root():
-    return {
-        "system": "SCG Content Machine",
-        "status": "ONLINE",
-        "version": "1.4.0"
-    }
-
-
-# =========================================================
-# HEALTHCHECK
-# =========================================================
-
-@app.get("/health")
-def health():
-
-    database_status = "disconnected"
-    redis_status = "disconnected"
-
-    try:
-        if not DATABASE_URL:
-            raise RuntimeError(
-                "DATABASE_URL is missing"
-            )
-
-        with psycopg.connect(
-            DATABASE_URL,
-            connect_timeout=5
-        ) as conn:
-
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-
-        database_status = "connected"
-
-    except Exception as exc:
-        print(
-            "DATABASE HEALTH ERROR:",
-            repr(exc)
-        )
-
-    try:
-        client = get_redis()
-        client.ping()
-
-        redis_status = "connected"
-
-    except Exception as exc:
-        print(
-            "REDIS HEALTH ERROR:",
-            repr(exc)
-        )
-
-    healthy = (
-        database_status == "connected"
-        and redis_status == "connected"
+    score = analysis.get(
+        "visual_quality_score",
+        "-"
     )
 
-    payload = {
-        "status":
-            "healthy"
-            if healthy
-            else "unhealthy",
-        "service": "content-machine",
-        "version": "1.4.0",
-        "database": database_status,
-        "redis": redis_status
-    }
+    angle = analysis.get(
+        "recommended_angle",
+        "-"
+    )
 
-    return JSONResponse(
-        payload,
-        status_code=(
-            200
-            if healthy
-            else 503
+    idea = analysis.get(
+        "content_idea",
+        "-"
+    )
+
+    product = analysis.get(
+        "product",
+        "-"
+    )
+
+    usable = analysis.get(
+        "usable",
+        False
+    )
+
+    selling_points = analysis.get(
+        "selling_points",
+        []
+    )
+
+    issues = analysis.get(
+        "visual_issues",
+        []
+    )
+
+    strengths = analysis.get(
+        "visual_strengths",
+        []
+    )
+
+    selling_text = "\n".join(
+        f"• {item}"
+        for item in selling_points[:3]
+    )
+
+    strength_text = "\n".join(
+        f"• {item}"
+        for item in strengths[:3]
+    )
+
+    issue_text = "\n".join(
+        f"• {item}"
+        for item in issues[:3]
+    )
+
+    if not selling_text:
+        selling_text = "• -"
+
+    if not strength_text:
+        strength_text = "• -"
+
+    if not issue_text:
+        issue_text = (
+            "• Tidak ada masalah visual "
+            "utama terdeteksi"
         )
+
+    usable_text = (
+        "LAYAK"
+        if usable
+        else "PERLU DIPERBAIKI"
+    )
+
+    return (
+        "🧠 AI selesai menganalisis foto."
+        "\n\n"
+
+        f"🪟 Produk: {product}\n"
+        f"⭐ Asset Quality: {score}/10\n"
+        f"✅ Status aset: {usable_text}\n"
+        f"🎯 Angle: {angle}\n"
+        f"📱 Format: {content_format}"
+
+        "\n\n"
+        "✨ Kekuatan visual:\n"
+        f"{strength_text}"
+
+        "\n\n"
+        "💎 Selling point:\n"
+        f"{selling_text}"
+
+        "\n\n"
+        "⚠️ Catatan visual:\n"
+        f"{issue_text}"
+
+        "\n\n"
+        "💡 Ide konten:\n"
+        f"{idea}"
+
+        "\n\n"
+        "Hasil analisis sudah tersimpan "
+        "di Content Machine."
     )
 
 
-# =========================================================
-# TELEGRAM WEBHOOK
-# =========================================================
+# ============================================================
+# TASK VALIDATION
+# ============================================================
 
-@app.post("/telegram/webhook")
-async def telegram_webhook(
-    request: Request,
-    x_telegram_bot_api_secret_token: str | None = Header(
-        default=None
-    )
-):
+def validate_task(
+    task: Dict[str, Any]
+) -> Dict[str, Any]:
 
-    # =====================================================
-    # SECURITY
-    # =====================================================
+    required = [
+        "job_id",
+        "chat_id",
+        "file_path"
+    ]
 
-    if not TELEGRAM_WEBHOOK_SECRET:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Telegram webhook secret "
-                "is not configured"
-            )
+    missing = [
+        key
+        for key in required
+        if not task.get(key)
+    ]
+
+    if missing:
+        raise ValueError(
+            "Queue task missing fields: "
+            + ", ".join(missing)
         )
 
-    if (
-        x_telegram_bot_api_secret_token
-        != TELEGRAM_WEBHOOK_SECRET
+    return task
+
+
+# ============================================================
+# PROCESS TASK
+# ============================================================
+
+def process_task(
+    task: Dict[str, Any]
+) -> None:
+
+    task = validate_task(
+        task
+    )
+
+    job_id = str(
+        task["job_id"]
+    )
+
+    chat_id = int(
+        task["chat_id"]
+    )
+
+    file_path = str(
+        task["file_path"]
+    )
+
+    brand = str(
+        task.get(
+            "brand",
+            "UNKNOWN"
+        )
+    ).upper()
+
+    content_format = str(
+        task.get(
+            "format",
+            "UNKNOWN"
+        )
+    ).upper()
+
+    objective = str(
+        task.get(
+            "objective",
+            "AUTO"
+        )
+    ).upper()
+
+    mime_hint = str(
+        task.get(
+            "mime_type",
+            "image/jpeg"
+        )
+    )
+
+    logger.info(
+        (
+            "Processing job=%s "
+            "brand=%s format=%s "
+            "objective=%s"
+        ),
+        job_id,
+        brand,
+        content_format,
+        objective
+    )
+
+    # --------------------------------------------------------
+    # IDEMPOTENCY
+    # --------------------------------------------------------
+
+    if analysis_exists(
+        job_id
     ):
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid webhook secret"
-        )
 
-    update = await request.json()
-
-    print(
-        "TELEGRAM UPDATE RECEIVED"
-    )
-
-    # =====================================================
-    # CALLBACK QUERY
-    # =====================================================
-
-    callback_query = update.get(
-        "callback_query"
-    )
-
-    if callback_query:
-
-        callback_id = callback_query.get(
-            "id"
-        )
-
-        callback_data = callback_query.get(
-            "data",
-            ""
-        )
-
-        callback_message = callback_query.get(
-            "message",
-            {}
-        )
-
-        callback_chat = callback_message.get(
-            "chat",
-            {}
-        )
-
-        callback_chat_id = callback_chat.get(
-            "id"
-        )
-
-        if callback_id:
-            try:
-                answer_callback_query(
-                    callback_id
-                )
-            except Exception as exc:
-                print(
-                    "CALLBACK ANSWER ERROR:",
-                    repr(exc)
-                )
-
-        if not callback_chat_id:
-            return {"ok": True}
-
-        # =================================================
-        # BRAND SCG
-        # =================================================
-
-        if callback_data == "brand:SCG":
-
-            format_keyboard = {
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": "Feed",
-                            "callback_data":
-                                "format:SCG:FEED"
-                        },
-                        {
-                            "text": "Carousel",
-                            "callback_data":
-                                "format:SCG:CAROUSEL"
-                        }
-                    ],
-                    [
-                        {
-                            "text": "Story",
-                            "callback_data":
-                                "format:SCG:STORY"
-                        },
-                        {
-                            "text": "Feed + Story",
-                            "callback_data":
-                                "format:SCG:FEED_STORY"
-                        }
-                    ]
-                ]
-            }
-
-            send_message(
-                callback_chat_id,
-                "✅ Brand dipilih: SCG\n\n"
-                "Sekarang pilih format konten:",
-                format_keyboard
-            )
-
-        # =================================================
-        # BRAND ILMI
-        # =================================================
-
-        elif callback_data == "brand:ILMI":
-
-            format_keyboard = {
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": "Feed",
-                            "callback_data":
-                                "format:ILMI:FEED"
-                        },
-                        {
-                            "text": "Carousel",
-                            "callback_data":
-                                "format:ILMI:CAROUSEL"
-                        }
-                    ],
-                    [
-                        {
-                            "text": "Story",
-                            "callback_data":
-                                "format:ILMI:STORY"
-                        },
-                        {
-                            "text": "Feed + Story",
-                            "callback_data":
-                                "format:ILMI:FEED_STORY"
-                        }
-                    ]
-                ]
-            }
-
-            send_message(
-                callback_chat_id,
-                "✅ Brand dipilih: ILMI\n\n"
-                "Sekarang pilih format konten:",
-                format_keyboard
-            )
-
-        # =================================================
-        # FORMAT
-        # =================================================
-
-        elif callback_data.startswith(
-            "format:"
-        ):
-
-            parts = callback_data.split(":")
-
-            if len(parts) == 3:
-
-                brand = parts[1]
-                content_format = parts[2]
-
-                objective_keyboard = {
-                    "inline_keyboard": [
-                        [
-                            {
-                                "text":
-                                    "🤖 AI Otomatis",
-                                "callback_data":
-                                    (
-                                        f"objective:"
-                                        f"{brand}:"
-                                        f"{content_format}:"
-                                        "AUTO"
-                                    )
-                            }
-                        ],
-                        [
-                            {
-                                "text":
-                                    "📚 Edukasi",
-                                "callback_data":
-                                    (
-                                        f"objective:"
-                                        f"{brand}:"
-                                        f"{content_format}:"
-                                        "EDUKASI"
-                                    )
-                            },
-                            {
-                                "text":
-                                    "✨ Showcase",
-                                "callback_data":
-                                    (
-                                        f"objective:"
-                                        f"{brand}:"
-                                        f"{content_format}:"
-                                        "SHOWCASE"
-                                    )
-                            }
-                        ],
-                        [
-                            {
-                                "text":
-                                    "🔥 Promo",
-                                "callback_data":
-                                    (
-                                        f"objective:"
-                                        f"{brand}:"
-                                        f"{content_format}:"
-                                        "PROMO"
-                                    )
-                            },
-                            {
-                                "text":
-                                    "💬 Testimoni",
-                                "callback_data":
-                                    (
-                                        f"objective:"
-                                        f"{brand}:"
-                                        f"{content_format}:"
-                                        "TESTIMONI"
-                                    )
-                            }
-                        ]
-                    ]
-                }
-
-                send_message(
-                    callback_chat_id,
-                    (
-                        "✅ Format dipilih: "
-                        f"{content_format}\n\n"
-                        "Sekarang pilih tujuan konten:"
-                    ),
-                    objective_keyboard
-                )
-
-        # =================================================
-        # OBJECTIVE
-        # =================================================
-
-        elif callback_data.startswith(
-            "objective:"
-        ):
-
-            parts = callback_data.split(":")
-
-            if len(parts) == 4:
-
-                brand = parts[1]
-                content_format = parts[2]
-                objective = parts[3]
-
-                save_session(
-                    callback_chat_id,
-                    {
-                        "brand":
-                            brand,
-                        "format":
-                            content_format,
-                        "objective":
-                            objective,
-                        "status":
-                            "WAITING_PHOTO"
-                    }
-                )
-
-                send_message(
-                    callback_chat_id,
-                    (
-                        "✅ Brief konten berhasil dibuat."
-                        "\n\n"
-                        f"🏷 Brand: {brand}\n"
-                        f"🖼 Format: {content_format}\n"
-                        f"🎯 Objective: {objective}"
-                        "\n\n"
-                        "📸 Sekarang kirim foto yang "
-                        "ingin dibuatkan konten."
-                    )
-                )
-
-        return {"ok": True}
-
-    # =====================================================
-    # NORMAL MESSAGE
-    # =====================================================
-
-    message = update.get("message")
-
-    if not message:
-        return {"ok": True}
-
-    chat = message.get(
-        "chat",
-        {}
-    )
-
-    chat_id = chat.get("id")
-
-    if not chat_id:
-        return {"ok": True}
-
-    text = message.get(
-        "text",
-        ""
-    )
-
-    # =====================================================
-    # /START
-    # =====================================================
-
-    if text == "/start":
-
-        try:
-            delete_session(chat_id)
-
-        except Exception as exc:
-            print(
-                "SESSION RESET ERROR:",
-                repr(exc)
-            )
-
-        brand_keyboard = {
-            "inline_keyboard": [
-                [
-                    {
-                        "text": "SCG",
-                        "callback_data":
-                            "brand:SCG"
-                    },
-                    {
-                        "text": "ILMI",
-                        "callback_data":
-                            "brand:ILMI"
-                    }
-                ]
-            ]
-        }
-
-        send_message(
-            chat_id,
+        logger.warning(
             (
-                "👋 Selamat datang di "
-                "SCG Content Machine.\n\n"
-                "Pilih brand yang ingin "
-                "dibuatkan konten:"
+                "Analysis already exists "
+                "job=%s. Duplicate skipped."
             ),
-            brand_keyboard
+            job_id
         )
 
-        return {"ok": True}
+        return
 
-    # =====================================================
-    # PHOTO RECEIVED
-    # =====================================================
+    # --------------------------------------------------------
+    # USER STATUS
+    # --------------------------------------------------------
 
-    photos = message.get("photo")
+    send_message(
+        chat_id,
+        (
+            "🧠 AI sedang menganalisis foto "
+            "dengan Astra..."
+        )
+    )
 
-    if photos:
+    # --------------------------------------------------------
+    # DOWNLOAD
+    # --------------------------------------------------------
 
-        # -------------------------------------------------
-        # LOAD SESSION
-        # -------------------------------------------------
+    image_bytes = (
+        download_telegram_image(
+            file_path
+        )
+    )
+
+    mime_type = detect_mime_type(
+        image_bytes,
+        mime_hint
+    )
+
+    # --------------------------------------------------------
+    # AI
+    # --------------------------------------------------------
+
+    result = analyze_image(
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        brand=brand,
+        content_format=content_format,
+        objective=objective
+    )
+
+    analysis = result[
+        "analysis"
+    ]
+
+    model = result[
+        "model"
+    ]
+
+    usage = result[
+        "usage"
+    ]
+
+    # --------------------------------------------------------
+    # STORE AI METADATA
+    # --------------------------------------------------------
+
+    stored_analysis = dict(
+        analysis
+    )
+
+    stored_analysis["_meta"] = {
+        "response_id":
+            result.get(
+                "response_id"
+            ),
+
+        "model":
+            model,
+
+        "reasoning_effort":
+            OPENAI_REASONING_EFFORT,
+
+        "image_detail":
+            "high",
+
+        "input_tokens":
+            usage.get(
+                "input_tokens",
+                0
+            ),
+
+        "output_tokens":
+            usage.get(
+                "output_tokens",
+                0
+            ),
+
+        "total_tokens":
+            usage.get(
+                "total_tokens",
+                0
+            ),
+
+        "worker_version":
+            "1.4.1"
+    }
+
+    # --------------------------------------------------------
+    # DATABASE
+    # --------------------------------------------------------
+
+    save_analysis(
+        job_id=job_id,
+        model=model,
+        analysis=stored_analysis
+    )
+
+    logger.info(
+        (
+            "Analysis saved "
+            "job=%s model=%s tokens=%s"
+        ),
+        job_id,
+        model,
+        usage.get(
+            "total_tokens",
+            0
+        )
+    )
+
+    # --------------------------------------------------------
+    # RESULT TO USER
+    # --------------------------------------------------------
+
+    send_message(
+        chat_id,
+        format_analysis_message(
+            analysis=analysis,
+            content_format=content_format
+        )
+    )
+
+
+# ============================================================
+# WORKER LOOP
+# ============================================================
+
+def run_worker():
+
+    logger.info(
+        (
+            "SCG Content Machine "
+            "AI Worker V1.4.1 starting"
+        )
+    )
+
+    logger.info(
+        (
+            "Model=%s "
+            "Reasoning=%s "
+            "Queue=%s"
+        ),
+        OPENAI_VISION_MODEL,
+        OPENAI_REASONING_EFFORT,
+        QUEUE_NAME
+    )
+
+    redis_client.ping()
+
+    logger.info(
+        "Redis connected. Waiting for jobs..."
+    )
+
+    while True:
 
         try:
-            session = get_session(
-                chat_id
+
+            item = redis_client.blpop(
+                QUEUE_NAME,
+                timeout=30
             )
 
-        except Exception as exc:
-            print(
-                "SESSION READ ERROR:",
-                repr(exc)
-            )
+            if not item:
+                continue
 
-            send_message(
-                chat_id,
-                (
-                    "❌ Sistem gagal membaca brief "
-                    "konten.\n\n"
-                    "Silakan ketik /start "
-                    "dan coba lagi."
-                )
-            )
+            _, raw_payload = item
 
-            return {"ok": True}
+            # ------------------------------------------------
+            # PARSE QUEUE PAYLOAD
+            # ------------------------------------------------
 
-        if not session:
+            try:
 
-            send_message(
-                chat_id,
-                (
-                    "⚠️ Brief konten tidak ditemukan "
-                    "atau sudah kedaluwarsa.\n\n"
-                    "Ketik /start untuk membuat "
-                    "brief baru."
-                )
-            )
-
-            return {"ok": True}
-
-        if (
-            session.get("status")
-            != "WAITING_PHOTO"
-        ):
-
-            send_message(
-                chat_id,
-                (
-                    "⚠️ Sistem belum menunggu foto."
-                    "\n\n"
-                    "Ketik /start untuk memulai ulang."
-                )
-            )
-
-            return {"ok": True}
-
-        # -------------------------------------------------
-        # HIGHEST RESOLUTION PHOTO
-        # -------------------------------------------------
-
-        photo = photos[-1]
-
-        telegram_file_id = photo.get(
-            "file_id"
-        )
-
-        telegram_file_unique_id = photo.get(
-            "file_unique_id"
-        )
-
-        if not telegram_file_id:
-
-            send_message(
-                chat_id,
-                (
-                    "❌ File foto tidak valid. "
-                    "Silakan kirim ulang."
-                )
-            )
-
-            return {"ok": True}
-
-        # -------------------------------------------------
-        # GET TELEGRAM FILE + DATABASE
-        # -------------------------------------------------
-
-        try:
-
-            telegram_file = get_telegram_file(
-                telegram_file_id
-            )
-
-            telegram_file_path = (
-                telegram_file.get(
-                    "file_path"
-                )
-            )
-
-            if not telegram_file_path:
-                raise RuntimeError(
-                    "Telegram file_path is missing"
+                task = json.loads(
+                    raw_payload
                 )
 
-            job_id, created = (
-                create_job_and_asset(
-                    chat_id=chat_id,
-                    message_id=message.get(
-                        "message_id"
-                    ),
-                    brand=session["brand"],
-                    content_format=session["format"],
-                    objective=session["objective"],
-                    telegram_file_id=(
-                        telegram_file_id
-                    ),
-                    telegram_file_unique_id=(
-                        telegram_file_unique_id
-                    ),
-                    telegram_file_path=(
-                        telegram_file_path
+                if not isinstance(
+                    task,
+                    dict
+                ):
+                    raise ValueError(
+                        (
+                            "Queue payload must "
+                            "be a JSON object"
+                        )
                     )
-                )
-            )
 
-            # =================================================
-            # NEW JOB
-            # =================================================
+            except Exception:
 
-            if created:
-
-                # ---------------------------------------------
-                # ACKNOWLEDGE INGESTION FIRST
-                # ---------------------------------------------
-
-                send_message(
-                    chat_id,
-                    (
-                        "✅ Foto berhasil diterima."
-                        "\n\n"
-                        f"🆔 Job: {job_id}\n"
-                        f"🏷 Brand: "
-                        f"{session['brand']}\n"
-                        f"🖼 Format: "
-                        f"{session['format']}\n"
-                        f"🎯 Objective: "
-                        f"{session['objective']}"
-                        "\n\n"
-                        "🧠 Foto sudah masuk ke "
-                        "Content Machine.\n"
-                        "AI akan menganalisis foto."
-                    )
+                logger.exception(
+                    "Invalid queue payload"
                 )
 
-                # ---------------------------------------------
-                # AI QUEUE
-                # ---------------------------------------------
+                continue
+
+            # ------------------------------------------------
+            # PROCESS
+            # ------------------------------------------------
+
+            try:
+
+                process_task(
+                    task
+                )
+
+            except Exception as exc:
+
+                job_id = task.get(
+                    "job_id",
+                    "UNKNOWN"
+                )
+
+                chat_id = task.get(
+                    "chat_id"
+                )
+
+                logger.exception(
+                    "Analysis failed job=%s",
+                    job_id
+                )
+
+                # --------------------------------------------
+                # ERROR LEDGER IN REDIS
+                # --------------------------------------------
 
                 try:
 
-                    enqueue_analysis(
-                        job_id=job_id,
-                        chat_id=chat_id,
-                        file_path=telegram_file_path,
-                        brand=session["brand"],
-                        content_format=session["format"],
-                        objective=session["objective"],
-                        mime_type="image/jpeg"
+                    redis_client.setex(
+                        (
+                            "contentmachine:"
+                            "analysis_error:"
+                            f"{job_id}"
+                        ),
+                        604800,
+                        str(exc)[:2000]
                     )
 
-                    print(
-                        "AI ANALYSIS ENQUEUED:",
-                        job_id
+                except Exception:
+
+                    logger.exception(
+                        (
+                            "Failed recording "
+                            "analysis error"
+                        )
                     )
 
-                except Exception as queue_exc:
+                # --------------------------------------------
+                # USER NOTIFICATION
+                # --------------------------------------------
 
-                    # PENTING:
-                    # Job + asset sudah committed.
-                    # Queue gagal TIDAK boleh membuat
-                    # user mengira foto gagal disimpan.
-
-                    print(
-                        "AI QUEUE ERROR:",
-                        job_id,
-                        repr(queue_exc)
-                    )
+                if chat_id:
 
                     send_message(
-                        chat_id,
+                        int(chat_id),
                         (
-                            "⚠️ Foto sudah aman tersimpan, "
-                            "tetapi antrean analisis AI "
-                            "belum berhasil dibuat.\n\n"
+                            "⚠️ Analisis AI belum berhasil."
+                            "\n\n"
+                            "Foto tetap aman tercatat "
+                            "di Content Machine.\n"
                             f"🆔 Job: {job_id}"
                         )
                     )
 
-                # Session dihapus setelah ingestion selesai.
-                delete_session(
-                    chat_id
-                )
+        except redis.exceptions.RedisError:
 
-            # =================================================
-            # DUPLICATE
-            # =================================================
-
-            else:
-
-                send_message(
-                    chat_id,
-                    (
-                        "ℹ️ Foto ini sudah pernah "
-                        "diterima.\n\n"
-                        f"🆔 Job: {job_id}"
-                    )
-                )
-
-            return {"ok": True}
-
-        except Exception as exc:
-
-            print(
-                "PHOTO PROCESSING ERROR:",
-                repr(exc)
+            logger.exception(
+                "Redis connection error"
             )
 
-            send_message(
-                chat_id,
-                (
-                    "❌ Foto diterima Telegram, "
-                    "tetapi gagal dimasukkan ke "
-                    "Content Machine.\n\n"
-                    "Silakan coba lagi beberapa saat."
-                )
+            time.sleep(5)
+
+        except Exception:
+
+            logger.exception(
+                "Unexpected worker loop error"
             )
 
-            return {"ok": True}
+            time.sleep(5)
 
-    # =====================================================
-    # DEFAULT
-    # =====================================================
 
-    send_message(
-        chat_id,
-        "Ketik /start untuk memulai Content Machine."
-    )
+# ============================================================
+# ENTRYPOINT
+# ============================================================
 
-    return {"ok": True}
+if __name__ == "__main__":
+    run_worker()
