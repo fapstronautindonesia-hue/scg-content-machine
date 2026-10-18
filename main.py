@@ -1,1820 +1,254 @@
-import os
-import json
-import uuid
-
-import psycopg
-import redis
-import requests
-
-from fastapi import FastAPI, Request, Header, HTTPException
+import logging
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from app.config import settings
+from app.redis_client import enqueue, claim, release, ping_redis
+from app.database import ping_database
+from app.telegram import send_message, answer_callback, get_file
+from app.services import drafts, sessions
+from app.services.jobs import get_job, create_revision, approve_job, reject_job, get_analysis_retry_task, set_job_status
+from app.services.events import record_event
 
-# =========================================================
-# SCG CONTENT MACHINE
-# V1.5.0
-#
-# FLOW:
-# Telegram
-# -> Brief
-# -> Photo
-# -> PostgreSQL
-# -> analysis_queue
-# -> Vision Worker
-# -> [Buat Konten]
-# -> content_queue
-# -> Content Worker
-# =========================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("content-machine-api")
+settings.validate_api()
+
+app = FastAPI(title="SCG Content Machine", version="2.0.0")
 
 
-# =========================================================
-# APP
-# =========================================================
-
-app = FastAPI(
-    title="SCG Content Machine",
-    version="1.5.0"
-)
-
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
-DATABASE_URL = os.getenv("DATABASE_URL")
-REDIS_URL = os.getenv("REDIS_URL")
-
-SESSION_TTL = 3600
-
-AI_ANALYSIS_QUEUE = os.getenv(
-    "AI_ANALYSIS_QUEUE",
-    "contentmachine:analysis_queue"
-)
-
-AI_CONTENT_QUEUE = os.getenv(
-    "AI_CONTENT_QUEUE",
-    "contentmachine:content_queue"
-)
-
-
-# =========================================================
-# REDIS
-# =========================================================
-
-def get_redis():
-
-    if not REDIS_URL:
-        raise RuntimeError(
-            "REDIS_URL is missing"
-        )
-
-    return redis.from_url(
-        REDIS_URL,
-        decode_responses=True,
-        socket_connect_timeout=5,
-        socket_timeout=5
-    )
-
-
-# =========================================================
-# SESSION
-# =========================================================
-
-def session_key(chat_id):
-
-    return f"content_session:{chat_id}"
-
-
-def save_session(
-    chat_id,
-    data
-):
-
-    client = get_redis()
-
-    client.setex(
-        session_key(chat_id),
-        SESSION_TTL,
-        json.dumps(data)
-    )
-
-
-def get_session(
-    chat_id
-):
-
-    client = get_redis()
-
-    raw = client.get(
-        session_key(chat_id)
-    )
-
-    if not raw:
-        return None
-
-    return json.loads(
-        raw
-    )
-
-
-def delete_session(
-    chat_id
-):
-
-    client = get_redis()
-
-    client.delete(
-        session_key(chat_id)
-    )
-
-
-# =========================================================
-# AI ANALYSIS QUEUE
-# =========================================================
-
-def enqueue_analysis(
-    job_id,
-    chat_id,
-    file_path,
-    brand,
-    content_format,
-    objective,
-    mime_type="image/jpeg"
-):
-
-    client = get_redis()
-
-    task = {
-        "job_id": str(job_id),
-        "chat_id": int(chat_id),
-        "file_path": file_path,
-        "brand": brand,
-        "format": content_format,
-        "objective": objective,
-        "mime_type": mime_type
-    }
-
-    client.rpush(
-        AI_ANALYSIS_QUEUE,
-        json.dumps(task)
-    )
-
-    return task
-
-
-# =========================================================
-# CONTENT GENERATION QUEUE
-# =========================================================
-
-def enqueue_content_generation(
-    job_id,
-    chat_id
-):
-
-    client = get_redis()
-
-    task = {
-        "job_id": str(job_id),
-        "chat_id": int(chat_id)
-    }
-
-    client.rpush(
-        AI_CONTENT_QUEUE,
-        json.dumps(task)
-    )
-
-    return task
-
-
-# =========================================================
-# CONTENT QUEUE IDEMPOTENCY
-# =========================================================
-
-def content_claim_key(
-    job_id
-):
-
-    return (
-        "contentmachine:"
-        f"content_claim:{job_id}"
-    )
-
-
-def claim_content_generation(
-    job_id
-):
-
-    client = get_redis()
-
-    # Prevent repeated taps from generating
-    # the same content multiple times.
-    #
-    # TTL = 30 minutes.
-    claimed = client.set(
-        content_claim_key(job_id),
-        "1",
-        nx=True,
-        ex=1800
-    )
-
-    return bool(
-        claimed
-    )
-
-
-def release_content_generation_claim(
-    job_id
-):
-
+def safe_event(job_id: str, event_type: str, actor: str = "system", payload: dict | None = None) -> None:
     try:
+        record_event(job_id, event_type, actor=actor, payload=payload)
+    except Exception:
+        logger.exception("Telemetry event failed open job=%s event=%s", job_id, event_type)
 
-        client = get_redis()
 
-        client.delete(
-            content_claim_key(job_id)
-        )
+def content_claim_key(job_id: str) -> str:
+    return f"contentmachine:content_claim:{job_id}"
 
-    except Exception as exc:
 
-        print(
-            "CONTENT CLAIM RELEASE ERROR:",
-            repr(exc)
-        )
+def enqueue_intake(chat_id: int) -> None:
+    enqueue(settings.intake_queue, {"chat_id": chat_id})
 
 
-# =========================================================
-# TELEGRAM HELPERS
-# =========================================================
+def enqueue_content(job_id: str, chat_id: int, revision_id: str | None = None) -> None:
+    enqueue(settings.content_queue, {"job_id": job_id, "chat_id": chat_id, "revision_id": revision_id})
 
-def telegram_api(
-    method: str,
-    payload: dict
-):
 
-    if not TELEGRAM_BOT_TOKEN:
-
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing"
-        )
-
-    url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/{method}"
-    )
-
-    response = requests.post(
-        url,
-        json=payload,
-        timeout=15
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if not data.get("ok"):
-
-        raise RuntimeError(
-            f"Telegram API error on {method}"
-        )
-
-    return data
-
-
-def send_message(
-    chat_id,
-    text,
-    reply_markup=None
-):
-
-    payload = {
-        "chat_id": chat_id,
-        "text": text
-    }
-
-    if reply_markup:
-
-        payload[
-            "reply_markup"
-        ] = reply_markup
-
-    return telegram_api(
-        "sendMessage",
-        payload
-    )
-
-
-def answer_callback_query(
-    callback_query_id,
-    text=None
-):
-
-    payload = {
-        "callback_query_id":
-            callback_query_id
-    }
-
-    if text:
-
-        payload["text"] = text
-
-    return telegram_api(
-        "answerCallbackQuery",
-        payload
-    )
-
-
-def get_telegram_file(
-    file_id
-):
-
-    response = telegram_api(
-        "getFile",
-        {
-            "file_id":
-                file_id
-        }
-    )
-
-    result = response.get(
-        "result"
-    )
-
-    if not result:
-
-        raise RuntimeError(
-            "Telegram getFile returned no result"
-        )
-
-    return result
-
-
-# =========================================================
-# DATABASE — CREATE JOB + ASSET
-# =========================================================
-
-def create_job_and_asset(
-    chat_id,
-    message_id,
-    brand,
-    content_format,
-    objective,
-    telegram_file_id,
-    telegram_file_unique_id,
-    telegram_file_path
-):
-
-    if not DATABASE_URL:
-
-        raise RuntimeError(
-            "DATABASE_URL is missing"
-        )
-
-    job_id = uuid.uuid4()
-    asset_id = uuid.uuid4()
-
-    external_id = (
-        f"telegram:{chat_id}:{message_id}"
-    )
-
-    with psycopg.connect(
-        DATABASE_URL,
-        connect_timeout=5
-    ) as conn:
-
-        with conn.cursor() as cur:
-
-            # ---------------------------------------------
-            # CREATE JOB
-            # ---------------------------------------------
-
-            cur.execute(
-                """
-                INSERT INTO jobs (
-                    id,
-                    source,
-                    external_id,
-                    brand,
-                    format,
-                    objective,
-                    status,
-                    requested_by
-                )
-                VALUES (
-                    %s,
-                    'telegram',
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    'RECEIVED',
-                    %s
-                )
-                ON CONFLICT DO NOTHING
-                RETURNING id
-                """,
-                (
-                    job_id,
-                    external_id,
-                    brand,
-                    content_format,
-                    objective,
-                    str(chat_id)
-                )
-            )
-
-            inserted_job = (
-                cur.fetchone()
-            )
-
-            # ---------------------------------------------
-            # DUPLICATE PROTECTION
-            # ---------------------------------------------
-
-            if not inserted_job:
-
-                cur.execute(
-                    """
-                    SELECT id
-                    FROM jobs
-                    WHERE source = 'telegram'
-                    AND external_id = %s
-                    LIMIT 1
-                    """,
-                    (
-                        external_id,
-                    )
-                )
-
-                existing_job = (
-                    cur.fetchone()
-                )
-
-                if not existing_job:
-
-                    raise RuntimeError(
-                        "Duplicate detected but "
-                        "existing job not found"
-                    )
-
-                return (
-                    str(existing_job[0]),
-                    False
-                )
-
-            # ---------------------------------------------
-            # CREATE ASSET
-            # ---------------------------------------------
-
-            metadata = {
-                "telegram_file_id":
-                    telegram_file_id,
-
-                "telegram_file_unique_id":
-                    telegram_file_unique_id,
-
-                "telegram_file_path":
-                    telegram_file_path,
-
-                "telegram_chat_id":
-                    chat_id,
-
-                "telegram_message_id":
-                    message_id
-            }
-
-            original_filename = (
-                telegram_file_path.split("/")[-1]
-                if telegram_file_path
-                else None
-            )
-
-            cur.execute(
-                """
-                INSERT INTO assets (
-                    id,
-                    job_id,
-                    asset_type,
-                    storage_provider,
-                    storage_key,
-                    original_filename,
-                    mime_type,
-                    metadata
-                )
-                VALUES (
-                    %s,
-                    %s,
-                    'IMAGE',
-                    'telegram',
-                    %s,
-                    %s,
-                    %s,
-                    %s::jsonb
-                )
-                """,
-                (
-                    asset_id,
-                    job_id,
-                    telegram_file_path,
-                    original_filename,
-                    "image/jpeg",
-                    json.dumps(
-                        metadata
-                    )
-                )
-            )
-
-        conn.commit()
-
-    return (
-        str(job_id),
-        True
-    )
-
-
-# =========================================================
-# DATABASE — CONTENT JOB VALIDATION
-# =========================================================
-
-def get_job_for_content(
-    job_id,
-    chat_id
-):
-
-    if not DATABASE_URL:
-
-        raise RuntimeError(
-            "DATABASE_URL is missing"
-        )
-
-    with psycopg.connect(
-        DATABASE_URL,
-        connect_timeout=5
-    ) as conn:
-
-        with conn.cursor() as cur:
-
-            cur.execute(
-                """
-                SELECT
-                    j.id,
-                    j.brand,
-                    j.format,
-                    j.objective,
-                    j.requested_by,
-                    EXISTS (
-                        SELECT 1
-                        FROM analyses an
-                        WHERE an.job_id = j.id
-                    ) AS has_analysis,
-                    EXISTS (
-                        SELECT 1
-                        FROM assets a
-                        WHERE a.job_id = j.id
-                    ) AS has_asset
-
-                FROM jobs j
-
-                WHERE j.id = %s
-                LIMIT 1
-                """,
-                (
-                    job_id,
-                )
-            )
-
-            row = (
-                cur.fetchone()
-            )
-
-    if not row:
-
-        return None
-
-    requested_by = str(
-        row[4] or ""
-    )
-
-    # Security:
-    # Only the Telegram chat that created
-    # the job may request content generation.
-    if requested_by != str(
-        chat_id
-    ):
-
-        return {
-            "authorized":
-                False
-        }
-
-    return {
-        "authorized":
-            True,
-
-        "job_id":
-            str(row[0]),
-
-        "brand":
-            row[1],
-
-        "format":
-            row[2],
-
-        "objective":
-            row[3],
-
-        "has_analysis":
-            bool(row[5]),
-
-        "has_asset":
-            bool(row[6])
-    }
-
-
-# =========================================================
-# BRAND KEYBOARD
-# =========================================================
-
-def brand_keyboard():
-
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text":
-                        "SCG",
-                    "callback_data":
-                        "brand:SCG"
-                },
-                {
-                    "text":
-                        "ILMI",
-                    "callback_data":
-                        "brand:ILMI"
-                }
-            ]
-        ]
-    }
-
-
-# =========================================================
-# FORMAT KEYBOARD
-# =========================================================
-
-def format_keyboard(
-    brand
-):
-
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text":
-                        "Feed",
-                    "callback_data":
-                        f"format:{brand}:FEED"
-                },
-                {
-                    "text":
-                        "Carousel",
-                    "callback_data":
-                        f"format:{brand}:CAROUSEL"
-                }
-            ],
-            [
-                {
-                    "text":
-                        "Story",
-                    "callback_data":
-                        f"format:{brand}:STORY"
-                },
-                {
-                    "text":
-                        "Feed + Story",
-                    "callback_data":
-                        f"format:{brand}:FEED_STORY"
-                }
-            ]
-        ]
-    }
-
-
-# =========================================================
-# OBJECTIVE KEYBOARD
-# =========================================================
-
-def objective_keyboard(
-    brand,
-    content_format
-):
-
-    prefix = (
-        f"objective:{brand}:"
-        f"{content_format}:"
-    )
-
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text":
-                        "🤖 AI Otomatis",
-                    "callback_data":
-                        prefix + "AUTO"
-                }
-            ],
-            [
-                {
-                    "text":
-                        "📚 Edukasi",
-                    "callback_data":
-                        prefix + "EDUKASI"
-                },
-                {
-                    "text":
-                        "✨ Showcase",
-                    "callback_data":
-                        prefix + "SHOWCASE"
-                }
-            ],
-            [
-                {
-                    "text":
-                        "🔥 Promo",
-                    "callback_data":
-                        prefix + "PROMO"
-                },
-                {
-                    "text":
-                        "💬 Testimoni",
-                    "callback_data":
-                        prefix + "TESTIMONI"
-                }
-            ]
-        ]
-    }
-
-
-# =========================================================
-# START FLOW
-# =========================================================
-
-def start_content_flow(
-    chat_id
-):
-
-    try:
-
-        delete_session(
-            chat_id
-        )
-
-    except Exception as exc:
-
-        print(
-            "SESSION RESET ERROR:",
-            repr(exc)
-        )
-
+def welcome(chat_id: int) -> None:
+    drafts.clear(chat_id)
+    sessions.clear(chat_id)
     send_message(
         chat_id,
-        (
-            "👋 Selamat datang di "
-            "SCG Content Machine.\n\n"
-            "Pilih brand yang ingin "
-            "dibuatkan konten:"
-        ),
-        brand_keyboard()
+        "👋 SCG Content Assistant siap.\n\n"
+        "Kirim foto atau album foto, lalu tulis perintah seperti ngobrol biasa.\n\n"
+        "Contoh:\n"
+        "• Upload ini sebagai Story IG SCG. Minimalis, logo saja.\n"
+        "• Hasil pemasangan Ibu Cindy. Pilih foto terbaik dan buatkan Feed SCG.\n"
+        "• Dari 8 foto ini buat Carousel SCG + beberapa Story. Jangan terlalu selling."
     )
 
-
-# =========================================================
-# ROOT
-# =========================================================
 
 @app.get("/")
 def root():
+    return {"system": "SCG Content Machine", "status": "ONLINE", "version": "2.0.0", "ux": "conversation-first"}
 
-    return {
-        "system":
-            "SCG Content Machine",
-
-        "status":
-            "ONLINE",
-
-        "version":
-            "1.5.0"
-    }
-
-
-# =========================================================
-# HEALTHCHECK
-# =========================================================
 
 @app.get("/health")
 def health():
+    db_ok, redis_ok = ping_database(), ping_redis()
+    healthy = db_ok and redis_ok
+    return JSONResponse({
+        "status": "healthy" if healthy else "unhealthy",
+        "service": "content-machine",
+        "version": "2.0.0",
+        "database": "connected" if db_ok else "disconnected",
+        "redis": "connected" if redis_ok else "disconnected",
+    }, status_code=200 if healthy else 503)
 
-    database_status = (
-        "disconnected"
-    )
-
-    redis_status = (
-        "disconnected"
-    )
-
-    try:
-
-        if not DATABASE_URL:
-
-            raise RuntimeError(
-                "DATABASE_URL is missing"
-            )
-
-        with psycopg.connect(
-            DATABASE_URL,
-            connect_timeout=5
-        ) as conn:
-
-            with conn.cursor() as cur:
-
-                cur.execute(
-                    "SELECT 1"
-                )
-
-                cur.fetchone()
-
-        database_status = (
-            "connected"
-        )
-
-    except Exception as exc:
-
-        print(
-            "DATABASE HEALTH ERROR:",
-            repr(exc)
-        )
-
-    try:
-
-        client = get_redis()
-
-        client.ping()
-
-        redis_status = (
-            "connected"
-        )
-
-    except Exception as exc:
-
-        print(
-            "REDIS HEALTH ERROR:",
-            repr(exc)
-        )
-
-    healthy = (
-        database_status
-        == "connected"
-
-        and
-
-        redis_status
-        == "connected"
-    )
-
-    payload = {
-        "status":
-            (
-                "healthy"
-                if healthy
-                else "unhealthy"
-            ),
-
-        "service":
-            "content-machine",
-
-        "version":
-            "1.5.0",
-
-        "database":
-            database_status,
-
-        "redis":
-            redis_status
-    }
-
-    return JSONResponse(
-        payload,
-        status_code=(
-            200
-            if healthy
-            else 503
-        )
-    )
-
-
-# =========================================================
-# TELEGRAM WEBHOOK
-# =========================================================
 
 @app.post("/telegram/webhook")
-async def telegram_webhook(
-    request: Request,
-    x_telegram_bot_api_secret_token:
-        str | None = Header(
-            default=None
-        )
-):
-
-    # =====================================================
-    # SECURITY
-    # =====================================================
-
-    if not TELEGRAM_WEBHOOK_SECRET:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Telegram webhook secret "
-                "is not configured"
-            )
-        )
-
-    if (
-        x_telegram_bot_api_secret_token
-        != TELEGRAM_WEBHOOK_SECRET
-    ):
-
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid webhook secret"
-        )
+async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: str | None = Header(default=None)):
+    if x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     update = await request.json()
-
-    print(
-        "TELEGRAM UPDATE RECEIVED"
-    )
-
-    # =====================================================
-    # CALLBACK QUERY
-    # =====================================================
-
-    callback_query = update.get(
-        "callback_query"
-    )
-
-    if callback_query:
-
-        callback_id = (
-            callback_query.get(
-                "id"
-            )
-        )
-
-        callback_data = (
-            callback_query.get(
-                "data",
-                ""
-            )
-        )
-
-        callback_message = (
-            callback_query.get(
-                "message",
-                {}
-            )
-        )
-
-        callback_chat = (
-            callback_message.get(
-                "chat",
-                {}
-            )
-        )
-
-        callback_chat_id = (
-            callback_chat.get(
-                "id"
-            )
-        )
-
-        # ---------------------------------------------
-        # ACK CALLBACK
-        # ---------------------------------------------
-
+    callback = update.get("callback_query")
+    if callback:
+        callback_id = callback.get("id")
+        data = callback.get("data", "")
+        chat_id = ((callback.get("message") or {}).get("chat") or {}).get("id")
         if callback_id:
-
             try:
-
-                answer_callback_query(
-                    callback_id
-                )
-
-            except Exception as exc:
-
-                print(
-                    "CALLBACK ANSWER ERROR:",
-                    repr(exc)
-                )
-
-        if not callback_chat_id:
-
-            return {
-                "ok":
-                    True
-            }
-
-        # =================================================
-        # CONTENT — CREATE
-        # =================================================
-
-        if callback_data.startswith(
-            "content:create:"
-        ):
-
-            parts = (
-                callback_data.split(
-                    ":",
-                    2
-                )
-            )
-
-            if len(parts) != 3:
-
-                send_message(
-                    callback_chat_id,
-                    (
-                        "❌ Permintaan konten "
-                        "tidak valid."
-                    )
-                )
-
-                return {
-                    "ok":
-                        True
-                }
-
-            job_id = (
-                parts[2].strip()
-            )
-
-            try:
-
-                job = get_job_for_content(
-                    job_id,
-                    callback_chat_id
-                )
-
-                if not job:
-
-                    send_message(
-                        callback_chat_id,
-                        (
-                            "❌ Job tidak ditemukan.\n\n"
-                            "Silakan ketik /start "
-                            "untuk membuat konten baru."
-                        )
-                    )
-
-                    return {
-                        "ok":
-                            True
-                    }
-
-                if not job.get(
-                    "authorized"
-                ):
-
-                    send_message(
-                        callback_chat_id,
-                        (
-                            "⛔ Job ini tidak dapat "
-                            "diproses dari chat ini."
-                        )
-                    )
-
-                    return {
-                        "ok":
-                            True
-                    }
-
-                if not job.get(
-                    "has_asset"
-                ):
-
-                    send_message(
-                        callback_chat_id,
-                        (
-                            "❌ Foto untuk job ini "
-                            "tidak ditemukan."
-                        )
-                    )
-
-                    return {
-                        "ok":
-                            True
-                    }
-
-                if not job.get(
-                    "has_analysis"
-                ):
-
-                    send_message(
-                        callback_chat_id,
-                        (
-                            "⏳ Analisis AI untuk foto "
-                            "ini belum tersedia.\n\n"
-                            "Tunggu sampai analisis "
-                            "selesai terlebih dahulu."
-                        )
-                    )
-
-                    return {
-                        "ok":
-                            True
-                    }
-
-                # -----------------------------------------
-                # IDEMPOTENT CLAIM
-                # -----------------------------------------
-
-                claimed = (
-                    claim_content_generation(
-                        job_id
-                    )
-                )
-
-                if not claimed:
-
-                    send_message(
-                        callback_chat_id,
-                        (
-                            "⏳ Konten untuk job ini "
-                            "sudah masuk antrean atau "
-                            "sedang dibuat.\n\n"
-                            "Tidak perlu klik ulang."
-                        )
-                    )
-
-                    return {
-                        "ok":
-                            True
-                    }
-
-                # -----------------------------------------
-                # QUEUE
-                # -----------------------------------------
-
-                try:
-
-                    enqueue_content_generation(
-                        job_id=job_id,
-                        chat_id=(
-                            callback_chat_id
-                        )
-                    )
-
-                except Exception:
-
-                    release_content_generation_claim(
-                        job_id
-                    )
-
-                    raise
-
-                print(
-                    "CONTENT GENERATION ENQUEUED:",
-                    job_id
-                )
-
-                send_message(
-                    callback_chat_id,
-                    (
-                        "🎨 Permintaan diterima.\n\n"
-                        f"🆔 Job: {job_id}\n"
-                        f"🏷 Brand: {job['brand']}\n"
-                        f"📱 Format: {job['format']}\n\n"
-                        "Content Brain akan "
-                        "menyusun desain."
-                    )
-                )
-
-            except Exception as exc:
-
-                print(
-                    "CONTENT CREATE ERROR:",
-                    job_id,
-                    repr(exc)
-                )
-
-                send_message(
-                    callback_chat_id,
-                    (
-                        "⚠️ Konten belum berhasil "
-                        "masuk antrean.\n\n"
-                        "Analisis foto tetap aman "
-                        "tersimpan."
-                    )
-                )
-
-            return {
-                "ok":
-                    True
-            }
-
-        # =================================================
-        # CONTENT — RESTART
-        # =================================================
-
-        elif callback_data == (
-            "content:restart"
-        ):
-
-            start_content_flow(
-                callback_chat_id
-            )
-
-            return {
-                "ok":
-                    True
-            }
-
-        # =================================================
-        # CONTENT — APPROVE
-        # =================================================
-
-        elif callback_data.startswith(
-            "content:approve:"
-        ):
-
-            send_message(
-                callback_chat_id,
-                (
-                    "✅ Konten di-approve.\n\n"
-                    "Status approval sudah diterima "
-                    "oleh bot.\n\n"
-                    "Pada versi berikutnya status ini "
-                    "akan disimpan ke ledger konten "
-                    "dan diteruskan ke publishing."
-                )
-            )
-
-            return {
-                "ok":
-                    True
-            }
-
-        # =================================================
-        # CONTENT — REVISE
-        # =================================================
-
-        elif callback_data.startswith(
-            "content:revise:"
-        ):
-
-            send_message(
-                callback_chat_id,
-                (
-                    "✏️ Permintaan revisi diterima.\n\n"
-                    "Mesin revisi interaktif belum "
-                    "diaktifkan pada milestone V1.5.0."
-                )
-            )
-
-            return {
-                "ok":
-                    True
-            }
-
-        # =================================================
-        # CONTENT — REJECT
-        # =================================================
-
-        elif callback_data.startswith(
-            "content:reject:"
-        ):
-
-            send_message(
-                callback_chat_id,
-                (
-                    "❌ Konten ditolak.\n\n"
-                    "Antum bisa ketik /start untuk "
-                    "membuat konten baru."
-                )
-            )
-
-            return {
-                "ok":
-                    True
-            }
-
-        # =================================================
-        # BRAND SCG
-        # =================================================
-
-        elif callback_data == (
-            "brand:SCG"
-        ):
-
-            send_message(
-                callback_chat_id,
-                (
-                    "✅ Brand dipilih: SCG\n\n"
-                    "Sekarang pilih format konten:"
-                ),
-                format_keyboard(
-                    "SCG"
-                )
-            )
-
-        # =================================================
-        # BRAND ILMI
-        # =================================================
-
-        elif callback_data == (
-            "brand:ILMI"
-        ):
-
-            send_message(
-                callback_chat_id,
-                (
-                    "✅ Brand dipilih: ILMI\n\n"
-                    "Sekarang pilih format konten:"
-                ),
-                format_keyboard(
-                    "ILMI"
-                )
-            )
-
-        # =================================================
-        # FORMAT
-        # =================================================
-
-        elif callback_data.startswith(
-            "format:"
-        ):
-
-            parts = (
-                callback_data.split(
-                    ":"
-                )
-            )
-
-            if len(parts) == 3:
-
-                brand = parts[1]
-
-                content_format = (
-                    parts[2]
-                )
-
-                send_message(
-                    callback_chat_id,
-                    (
-                        "✅ Format dipilih: "
-                        f"{content_format}\n\n"
-                        "Sekarang pilih tujuan konten:"
-                    ),
-                    objective_keyboard(
-                        brand,
-                        content_format
-                    )
-                )
-
-        # =================================================
-        # OBJECTIVE
-        # =================================================
-
-        elif callback_data.startswith(
-            "objective:"
-        ):
-
-            parts = (
-                callback_data.split(
-                    ":"
-                )
-            )
-
-            if len(parts) == 4:
-
-                brand = parts[1]
-
-                content_format = (
-                    parts[2]
-                )
-
-                objective = parts[3]
-
-                save_session(
-                    callback_chat_id,
-                    {
-                        "brand":
-                            brand,
-
-                        "format":
-                            content_format,
-
-                        "objective":
-                            objective,
-
-                        "status":
-                            "WAITING_PHOTO"
-                    }
-                )
-
-                send_message(
-                    callback_chat_id,
-                    (
-                        "✅ Brief konten berhasil dibuat."
-                        "\n\n"
-                        f"🏷 Brand: {brand}\n"
-                        f"🖼 Format: {content_format}\n"
-                        f"🎯 Objective: {objective}"
-                        "\n\n"
-                        "📸 Sekarang kirim foto yang "
-                        "ingin dibuatkan konten."
-                    )
-                )
-
-        return {
-            "ok":
-                True
-        }
-
-    # =====================================================
-    # NORMAL MESSAGE
-    # =====================================================
-
-    message = update.get(
-        "message"
-    )
-
+                answer_callback(callback_id)
+            except Exception:
+                logger.exception("Failed answering callback")
+        if not chat_id:
+            return {"ok": True}
+
+        if data.startswith("content:approve:"):
+            job_id = data.split(":", 2)[2]
+            job = get_job(job_id)
+            if not job or job["requested_by"] != str(chat_id):
+                send_message(chat_id, "⛔ Approval tidak valid.")
+                return {"ok": True}
+            approve_job(job_id, str(chat_id))
+            safe_event(job_id, "APPROVED", actor=str(chat_id))
+            sessions.save(chat_id, {"status": "APPROVED", "job_id": job_id})
+            send_message(chat_id, "✅ Approved. Konten ini tercatat sebagai versi final.\n\nKalau mau bikin konten baru, langsung kirim foto lagi.")
+            return {"ok": True}
+
+        if data.startswith("content:reject:"):
+            job_id = data.split(":", 2)[2]
+            job = get_job(job_id)
+            if not job or job["requested_by"] != str(chat_id):
+                send_message(chat_id, "⛔ Reject tidak valid.")
+                return {"ok": True}
+            reject_job(job_id, str(chat_id))
+            safe_event(job_id, "REJECTED", actor=str(chat_id))
+            sessions.save(chat_id, {"status": "REJECTED", "job_id": job_id})
+            send_message(chat_id, "❌ Ditolak. Kalau mau versi baru, kirim foto/perintah baru kapan saja.")
+            return {"ok": True}
+
+        if data.startswith("content:revise:"):
+            job_id = data.split(":", 2)[2]
+            job = get_job(job_id)
+            if not job or job["requested_by"] != str(chat_id):
+                send_message(chat_id, "⛔ Revisi tidak valid.")
+                return {"ok": True}
+            sessions.save(chat_id, {"status": "WAITING_REVISION", "job_id": job_id})
+            send_message(chat_id, "✏️ Tulis saja revisinya seperti ngobrol biasa.\nContoh: cover pakai foto nomor 4, crop jangan terlalu dekat, caption jangan terlalu selling.")
+            return {"ok": True}
+
+        return {"ok": True}
+
+    message = update.get("message")
     if not message:
-
-        return {
-            "ok":
-                True
-        }
-
-    chat = message.get(
-        "chat",
-        {}
-    )
-
-    chat_id = chat.get(
-        "id"
-    )
-
+        return {"ok": True}
+    chat_id = (message.get("chat") or {}).get("id")
     if not chat_id:
+        return {"ok": True}
 
-        return {
-            "ok":
-                True
-        }
-
-    text = message.get(
-        "text",
-        ""
-    )
-
-    # =====================================================
-    # /START
-    # =====================================================
+    text = (message.get("text") or "").strip()
+    caption = (message.get("caption") or "").strip()
 
     if text == "/start":
+        welcome(chat_id)
+        return {"ok": True}
 
-        start_content_flow(
-            chat_id
-        )
+    session = sessions.load(chat_id)
 
-        return {
-            "ok":
-                True
-        }
+    # Natural recovery after a terminal worker failure.
+    if text and session and text.lower().strip() in {"coba lagi", "retry", "ulang", "lanjut", "lanjutkan"}:
+        failed_job_id = session.get("job_id")
+        if session.get("status") == "INTAKE_FAILED":
+            enqueue_intake(chat_id)
+            sessions.save(chat_id, {"status": "PROCESSING_INTAKE"})
+            send_message(chat_id, "♻️ Siap bro. Saya lanjutkan dari foto dan perintah yang sudah saya tampung.")
+            return {"ok": True}
+        if failed_job_id and session.get("status") == "ANALYSIS_FAILED":
+            job = get_job(failed_job_id)
+            if job and job["requested_by"] == str(chat_id):
+                task = get_analysis_retry_task(failed_job_id, chat_id)
+                enqueue(settings.analysis_queue, task)
+                set_job_status(failed_job_id, "QUEUED_ANALYSIS")
+                sessions.save(chat_id, {"status": "PROCESSING", "job_id": failed_job_id})
+                send_message(chat_id, "♻️ Siap bro. Saya lanjutkan analisis dari foto yang sudah tersimpan — tidak perlu upload ulang.")
+                return {"ok": True}
+        if failed_job_id and session.get("status") == "GENERATION_FAILED":
+            job = get_job(failed_job_id)
+            if job and job["requested_by"] == str(chat_id):
+                if claim(content_claim_key(failed_job_id), settings.content_claim_ttl):
+                    try:
+                        enqueue_content(failed_job_id, chat_id)
+                        sessions.save(chat_id, {"status": "PROCESSING", "job_id": failed_job_id})
+                        send_message(chat_id, "♻️ Siap bro. Saya lanjutkan render dari analisis yang sudah tersimpan.")
+                    except Exception:
+                        release(content_claim_key(failed_job_id))
+                        raise
+                else:
+                    send_message(chat_id, "⏳ Job ini sudah sedang diproses. Tunggu preview-nya ya bro.")
+                return {"ok": True}
 
-    # =====================================================
-    # PHOTO RECEIVED
-    # =====================================================
-
-    photos = message.get(
-        "photo"
-    )
-
-    if photos:
-
-        # ---------------------------------------------
-        # LOAD SESSION
-        # ---------------------------------------------
-
-        try:
-
-            session = get_session(
-                chat_id
-            )
-
-        except Exception as exc:
-
-            print(
-                "SESSION READ ERROR:",
-                repr(exc)
-            )
-
-            send_message(
-                chat_id,
-                (
-                    "❌ Sistem gagal membaca brief "
-                    "konten.\n\n"
-                    "Silakan ketik /start "
-                    "dan coba lagi."
-                )
-            )
-
-            return {
-                "ok":
-                    True
-            }
-
-        if not session:
-
-            send_message(
-                chat_id,
-                (
-                    "⚠️ Brief konten tidak ditemukan "
-                    "atau sudah kedaluwarsa.\n\n"
-                    "Ketik /start untuk membuat "
-                    "brief baru."
-                )
-            )
-
-            return {
-                "ok":
-                    True
-            }
-
-        if (
-            session.get(
-                "status"
-            )
-            != "WAITING_PHOTO"
-        ):
-
-            send_message(
-                chat_id,
-                (
-                    "⚠️ Sistem belum menunggu foto."
-                    "\n\n"
-                    "Ketik /start untuk memulai ulang."
-                )
-            )
-
-            return {
-                "ok":
-                    True
-            }
-
-        # ---------------------------------------------
-        # HIGHEST RESOLUTION PHOTO
-        # ---------------------------------------------
-
-        photo = photos[-1]
-
-        telegram_file_id = (
-            photo.get(
-                "file_id"
-            )
-        )
-
-        telegram_file_unique_id = (
-            photo.get(
-                "file_unique_id"
-            )
-        )
-
-        if not telegram_file_id:
-
-            send_message(
-                chat_id,
-                (
-                    "❌ File foto tidak valid. "
-                    "Silakan kirim ulang."
-                )
-            )
-
-            return {
-                "ok":
-                    True
-            }
-
-        # ---------------------------------------------
-        # GET TELEGRAM FILE + DATABASE
-        # ---------------------------------------------
-
-        try:
-
-            telegram_file = (
-                get_telegram_file(
-                    telegram_file_id
-                )
-            )
-
-            telegram_file_path = (
-                telegram_file.get(
-                    "file_path"
-                )
-            )
-
-            if not telegram_file_path:
-
-                raise RuntimeError(
-                    "Telegram file_path is missing"
-                )
-
-            job_id, created = (
-                create_job_and_asset(
-                    chat_id=chat_id,
-
-                    message_id=(
-                        message.get(
-                            "message_id"
-                        )
-                    ),
-
-                    brand=(
-                        session["brand"]
-                    ),
-
-                    content_format=(
-                        session["format"]
-                    ),
-
-                    objective=(
-                        session["objective"]
-                    ),
-
-                    telegram_file_id=(
-                        telegram_file_id
-                    ),
-
-                    telegram_file_unique_id=(
-                        telegram_file_unique_id
-                    ),
-
-                    telegram_file_path=(
-                        telegram_file_path
-                    )
-                )
-            )
-
-            # =========================================
-            # NEW JOB
-            # =========================================
-
-            if created:
-
-                # -------------------------------------
-                # ACKNOWLEDGE INGESTION FIRST
-                # -------------------------------------
-
-                send_message(
-                    chat_id,
-                    (
-                        "✅ Foto berhasil diterima."
-                        "\n\n"
-                        f"🆔 Job: {job_id}\n"
-                        f"🏷 Brand: "
-                        f"{session['brand']}\n"
-                        f"🖼 Format: "
-                        f"{session['format']}\n"
-                        f"🎯 Objective: "
-                        f"{session['objective']}"
-                        "\n\n"
-                        "🧠 Foto sudah masuk ke "
-                        "Content Machine.\n"
-                        "AI akan menganalisis foto."
-                    )
-                )
-
-                # -------------------------------------
-                # AI QUEUE
-                # -------------------------------------
-
+    # Natural approval/reject/revision after a preview.
+    if text and session and session.get("status") in {"WAITING_REVISION", "PREVIEW_READY"}:
+        current_draft = drafts.load(chat_id)
+        if not current_draft.get("photos"):
+            job_id = session.get("job_id")
+            job = get_job(job_id) if job_id else None
+            lower = text.lower().strip()
+            if job and job["requested_by"] == str(chat_id) and session.get("status") == "PREVIEW_READY":
+                if lower in {"approve", "approved", "acc", "oke acc", "ok acc", "setuju", "bagus approve"}:
+                    approve_job(job_id, str(chat_id))
+                    safe_event(job_id, "APPROVED", actor=str(chat_id), payload={"via": "natural_text"})
+                    sessions.save(chat_id, {"status": "APPROVED", "job_id": job_id})
+                    send_message(chat_id, "✅ Approved. Konten ini tercatat sebagai versi final.")
+                    return {"ok": True}
+                if lower in {"reject", "tolak", "ditolak", "nggak jadi", "ga jadi", "tidak jadi"}:
+                    reject_job(job_id, str(chat_id))
+                    safe_event(job_id, "REJECTED", actor=str(chat_id), payload={"via": "natural_text"})
+                    sessions.save(chat_id, {"status": "REJECTED", "job_id": job_id})
+                    send_message(chat_id, "❌ Ditolak. Kalau mau versi baru, langsung kirim foto/perintah baru.")
+                    return {"ok": True}
+            if job and job["requested_by"] == str(chat_id):
+                if not claim(content_claim_key(job_id), settings.content_claim_ttl):
+                    send_message(chat_id, "⏳ Versi sebelumnya masih diproses. Tunggu preview selesai dulu ya bro.")
+                    return {"ok": True}
                 try:
+                    revision_id = create_revision(job_id, text, str(chat_id))
+                    enqueue_content(job_id, chat_id, revision_id=revision_id)
+                    safe_event(job_id, "REVISION_REQUESTED", actor=str(chat_id), payload={"revision_id": revision_id, "instruction": text})
+                    sessions.save(chat_id, {"status": "PROCESSING_REVISION", "job_id": job_id})
+                    send_message(chat_id, "✏️ Siap. Saya revisi dari versi terakhir, bukan mulai dari nol.")
+                except Exception:
+                    release(content_claim_key(job_id))
+                    raise
+                return {"ok": True}
 
-                    enqueue_analysis(
-                        job_id=job_id,
+    # Photo / album intake.
+    photos = message.get("photo")
+    if photos:
+        photo = photos[-1]
+        file_id = photo.get("file_id")
+        if not file_id:
+            send_message(chat_id, "❌ Foto Telegram tidak valid.")
+            return {"ok": True}
+        tg_file = get_file(file_id)
+        file_path = tg_file.get("file_path")
+        if not file_path:
+            send_message(chat_id, "❌ Telegram tidak memberikan file path.")
+            return {"ok": True}
+        draft = drafts.add_photo(chat_id, {
+            "file_id": file_id,
+            "file_unique_id": photo.get("file_unique_id"),
+            "file_path": file_path,
+            "message_id": message.get("message_id"),
+            "media_group_id": message.get("media_group_id"),
+        }, caption=caption or None)
 
-                        chat_id=chat_id,
+        # If caption already contains the instruction, the worker waits briefly so the whole album can arrive.
+        if draft.get("instruction"):
+            enqueue_intake(chat_id)
+        else:
+            ack_key = f"contentmachine:photo_ack:{chat_id}"
+            if claim(ack_key, 5):
+                send_message(chat_id, "📸 Foto saya tampung dulu. Kirim semua fotonya, lalu tulis perintahnya dalam satu chat. Maksimal 12 foto per batch.")
+        return {"ok": True}
 
-                        file_path=(
-                            telegram_file_path
-                        ),
+    if text:
+        # A clarification answer extends the existing instruction instead of replacing it.
+        if session and session.get("status") == "WAITING_CLARIFICATION":
+            draft = drafts.append_instruction(chat_id, text)
+            sessions.clear(chat_id)
+        else:
+            draft = drafts.set_instruction(chat_id, text)
 
-                        brand=(
-                            session["brand"]
-                        ),
+        if not draft.get("photos"):
+            send_message(chat_id, "Siap. Sekarang kirim foto atau album fotonya bro — perintah ini saya tahan sementara.")
+            return {"ok": True}
 
-                        content_format=(
-                            session["format"]
-                        ),
+        enqueue_intake(chat_id)
+        return {"ok": True}
 
-                        objective=(
-                            session["objective"]
-                        ),
-
-                        mime_type=(
-                            "image/jpeg"
-                        )
-                    )
-
-                    print(
-                        "AI ANALYSIS ENQUEUED:",
-                        job_id
-                    )
-
-                except Exception as queue_exc:
-
-                    # Job + asset are already committed.
-                    # Queue failure must not pretend that
-                    # the photo was lost.
-
-                    print(
-                        "AI QUEUE ERROR:",
-                        job_id,
-                        repr(queue_exc)
-                    )
-
-                    send_message(
-                        chat_id,
-                        (
-                            "⚠️ Foto sudah aman tersimpan, "
-                            "tetapi antrean analisis AI "
-                            "belum berhasil dibuat.\n\n"
-                            f"🆔 Job: {job_id}"
-                        )
-                    )
-
-                # Session is complete after ingestion.
-                delete_session(
-                    chat_id
-                )
-
-            # =========================================
-            # DUPLICATE
-            # =========================================
-
-            else:
-
-                send_message(
-                    chat_id,
-                    (
-                        "ℹ️ Foto ini sudah pernah "
-                        "diterima.\n\n"
-                        f"🆔 Job: {job_id}"
-                    )
-                )
-
-            return {
-                "ok":
-                    True
-            }
-
-        except Exception as exc:
-
-            print(
-                "PHOTO PROCESSING ERROR:",
-                repr(exc)
-            )
-
-            send_message(
-                chat_id,
-                (
-                    "❌ Foto diterima Telegram, "
-                    "tetapi gagal dimasukkan ke "
-                    "Content Machine.\n\n"
-                    "Silakan coba lagi beberapa saat."
-                )
-            )
-
-            return {
-                "ok":
-                    True
-            }
-
-    # =====================================================
-    # DEFAULT
-    # =====================================================
-
-    send_message(
-        chat_id,
-        (
-            "Ketik /start untuk memulai "
-            "Content Machine."
-        )
-    )
-
-    return {
-        "ok":
-            True
-    }
+    return {"ok": True}
