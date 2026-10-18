@@ -13,28 +13,33 @@ from openai import OpenAI
 
 # ============================================================
 # SCG CONTENT MACHINE
-# V1.4 — AI VISION ANALYZER WORKER
+# V1.4.1 — AI VISION ANALYZER
+# GPT-6 ASTRA / MAX REASONING
 # ============================================================
 
 
-# ------------------------------------------------------------
+# ============================================================
 # CONFIG
-# ------------------------------------------------------------
+# ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Bisa diganti dari Coolify tanpa mengubah source code.
 OPENAI_VISION_MODEL = os.getenv(
     "OPENAI_VISION_MODEL",
-    "gpt-6-luna",
+    "gpt-6-astra"
+)
+
+OPENAI_REASONING_EFFORT = os.getenv(
+    "OPENAI_REASONING_EFFORT",
+    "max"
 )
 
 QUEUE_NAME = os.getenv(
     "AI_ANALYSIS_QUEUE",
-    "contentmachine:analysis_queue",
+    "contentmachine:analysis_queue"
 )
 
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -42,21 +47,23 @@ DOWNLOAD_TIMEOUT = 30
 TELEGRAM_TIMEOUT = 20
 
 
-# ------------------------------------------------------------
+# ============================================================
 # LOGGING
-# ------------------------------------------------------------
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-logger = logging.getLogger("content-machine-worker")
+logger = logging.getLogger(
+    "content-machine-ai-worker"
+)
 
 
-# ------------------------------------------------------------
+# ============================================================
 # ENV VALIDATION
-# ------------------------------------------------------------
+# ============================================================
 
 required_env = {
     "DATABASE_URL": DATABASE_URL,
@@ -78,25 +85,31 @@ if missing_env:
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # CLIENTS
-# ------------------------------------------------------------
+# ============================================================
 
 redis_client = redis.Redis.from_url(
     REDIS_URL,
     decode_responses=True,
+    socket_connect_timeout=5,
+    socket_timeout=35
 )
 
 openai_client = OpenAI(
-    api_key=OPENAI_API_KEY,
+    api_key=OPENAI_API_KEY
 )
 
 
-# ------------------------------------------------------------
-# TELEGRAM
-# ------------------------------------------------------------
+# ============================================================
+# TELEGRAM HELPERS
+# ============================================================
 
-def telegram_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def telegram_api(
+    method: str,
+    payload: Dict[str, Any]
+) -> Dict[str, Any]:
+
     url = (
         f"https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/{method}"
@@ -105,7 +118,7 @@ def telegram_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     response = requests.post(
         url,
         json=payload,
-        timeout=TELEGRAM_TIMEOUT,
+        timeout=TELEGRAM_TIMEOUT
     )
 
     response.raise_for_status()
@@ -114,39 +127,50 @@ def telegram_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if not data.get("ok"):
         raise RuntimeError(
-            f"Telegram API error on {method}: {data}"
+            f"Telegram API error on {method}"
         )
 
     return data
 
 
-def send_message(chat_id: int, text: str) -> None:
+def send_message(
+    chat_id: int,
+    text: str
+) -> None:
+
     try:
         telegram_api(
             "sendMessage",
             {
                 "chat_id": chat_id,
-                "text": text,
-            },
+                "text": text
+            }
         )
+
     except Exception:
-        # Telegram gagal tidak boleh membatalkan hasil AI/DB.
+        # Telegram notification failure must NOT
+        # roll back a completed AI analysis.
         logger.exception(
-            "Failed sending Telegram message chat_id=%s",
-            chat_id,
+            "Telegram send failed chat_id=%s",
+            chat_id
         )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # TELEGRAM IMAGE DOWNLOAD
-# ------------------------------------------------------------
+# ============================================================
 
-def download_telegram_image(file_path: str) -> bytes:
+def download_telegram_image(
+    file_path: str
+) -> bytes:
+
     if not file_path:
-        raise ValueError("Telegram file_path is empty")
+        raise ValueError(
+            "Telegram file_path is empty"
+        )
 
-    # file_path berasal dari Telegram getFile.
-    # Jangan log URL ini karena mengandung bot token.
+    # Never log this URL because it contains
+    # the Telegram bot token.
     url = (
         f"https://api.telegram.org/file/"
         f"bot{TELEGRAM_BOT_TOKEN}/{file_path}"
@@ -154,7 +178,7 @@ def download_telegram_image(file_path: str) -> bytes:
 
     response = requests.get(
         url,
-        timeout=DOWNLOAD_TIMEOUT,
+        timeout=DOWNLOAD_TIMEOUT
     )
 
     response.raise_for_status()
@@ -162,190 +186,209 @@ def download_telegram_image(file_path: str) -> bytes:
     image_bytes = response.content
 
     if not image_bytes:
-        raise ValueError("Downloaded Telegram image is empty")
+        raise ValueError(
+            "Downloaded image is empty"
+        )
 
     if len(image_bytes) > MAX_IMAGE_BYTES:
         raise ValueError(
-            f"Image too large: {len(image_bytes)} bytes"
+            "Image exceeds worker size limit"
         )
 
     return image_bytes
 
 
-# ------------------------------------------------------------
-# IMAGE MIME
-# ------------------------------------------------------------
+# ============================================================
+# MIME DETECTION
+# ============================================================
 
 def detect_mime_type(
     image_bytes: bytes,
-    fallback: str = "image/jpeg",
+    fallback: str = "image/jpeg"
 ) -> str:
 
-    if image_bytes.startswith(b"\xff\xd8\xff"):
+    if image_bytes.startswith(
+        b"\xff\xd8\xff"
+    ):
         return "image/jpeg"
 
-    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+    if image_bytes.startswith(
+        b"\x89PNG\r\n\x1a\n"
+    ):
         return "image/png"
 
-    if image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:16]:
+    if (
+        image_bytes.startswith(b"RIFF")
+        and b"WEBP" in image_bytes[:16]
+    ):
         return "image/webp"
 
     return fallback or "image/jpeg"
 
 
-# ------------------------------------------------------------
+# ============================================================
 # BRAND CONTEXT
-# ------------------------------------------------------------
+# ============================================================
 
-def brand_context(brand: str) -> str:
-    brand = (brand or "").upper()
+def brand_context(
+    brand: str
+) -> str:
+
+    brand = (
+        brand or ""
+    ).upper()
 
     if brand == "SCG":
+
         return """
-BRAND: SERBACANTIK GORDEN (SCG)
+BRAND: SERBACANTIK GORDEN / SCG
 
-Positioning:
-- Custom curtain / gorden dan instalasi.
-- Target utama rumah pribadi.
-- Area utama Makassar, Gowa, Maros.
-- Premium, elegant, warm, editorial interior.
-- Soft selling.
-- Visual harus terasa rapi dan berkelas.
+BUSINESS:
+Custom gorden dan instalasi.
 
-Produk dapat meliputi:
+TARGET:
+Rumah pribadi, terutama wilayah Makassar,
+Gowa, dan Maros.
+
+BRAND CHARACTER:
+Premium, elegant, warm, editorial interior,
+rapi, terpercaya, dan soft selling.
+
+PRODUCT CONTEXT MAY INCLUDE:
 - blackout curtain
-- vitrase / sheer curtain
+- vitrase / sheer
 - custom curtain
 - roller blind
 - venetian blind
 - curtain accessories
 
-Saat menganalisis, prioritaskan:
-- kualitas hasil pemasangan
-- komposisi gorden dan vitrase
-- warna dan kecocokan dengan interior
-- kerapian
-- daya jual visual
-- masalah foto yang mengurangi kualitas konten
+VISUAL PRIORITY:
+- hasil pemasangan
+- kerapian jahitan/pemasangan yang terlihat
+- perpaduan curtain dan vitrase
+- warna dengan interior
+- transformasi ruangan
+- selling point yang benar-benar terlihat
+- kekurangan foto yang mengurangi kualitas konten
 """
 
     if brand == "ILMI":
+
         return """
 BRAND: ILMI GORDEN
 
-Positioning:
-- Toko gorden yang mudah dijangkau.
-- Marketplace / social commerce.
-- Modern, clean, trusted.
-- Product-first.
-- Cocok untuk transaksi volume.
+POSITIONING:
+Toko gorden yang mudah dijangkau.
 
-Saat menganalisis, prioritaskan:
-- produk yang terlihat
+CHANNEL CHARACTER:
+Marketplace dan social commerce.
+
+BRAND CHARACTER:
+Modern, clean, trusted, practical,
+product-first.
+
+VISUAL PRIORITY:
+- produk
 - warna
 - motif
-- fungsi
-- ukuran atau penggunaan bila dapat dilihat
-- kekuatan visual untuk marketplace/social commerce
-- masalah foto yang mengurangi kejelasan produk
+- fungsi yang dapat disimpulkan secara aman
+- kejelasan produk
+- daya jual marketplace
+- kekurangan visual
 """
 
     return """
-BRAND:
-Brand belum dikenali secara spesifik.
-Analisis foto secara objektif sebagai aset konten gorden/interior.
+Analisis sebagai aset visual bisnis
+gorden/interior secara objektif.
 """
 
 
-# ------------------------------------------------------------
-# PROMPT
-# ------------------------------------------------------------
+# ============================================================
+# ANALYSIS PROMPT
+# ============================================================
 
 def build_analysis_prompt(
     brand: str,
     content_format: str,
-    objective: str,
+    objective: str
 ) -> str:
 
     return f"""
-Kamu adalah AI Vision Analyst untuk Content Machine bisnis gorden.
+Kamu adalah Senior Creative Director,
+Visual Merchandiser, dan Content Strategist
+untuk bisnis gorden.
 
 {brand_context(brand)}
 
-CONTENT REQUEST:
-- Brand: {brand}
-- Format: {content_format}
-- Objective: {objective}
+CONTENT BRIEF:
+Brand: {brand}
+Format: {content_format}
+Objective: {objective}
 
-TUGAS:
+TUGAS UTAMA:
 
-Analisis HANYA berdasarkan apa yang benar-benar terlihat pada foto.
+Analisis foto secara teliti untuk menentukan
+bagaimana aset ini sebaiknya digunakan sebagai
+materi konten.
 
-Jangan mengarang:
-- jenis kain jika tidak dapat dipastikan
-- persentase blackout
+Gunakan HANYA informasi yang benar-benar
+terlihat atau dapat disimpulkan secara aman
+dari gambar.
+
+DILARANG MENGARANG:
 - harga
 - ukuran
-- lokasi
+- lokasi customer
 - nama customer
+- merek kain
+- persentase blackout
+- bahan kain spesifik
 - spesifikasi teknis yang tidak terlihat
 
-Jika sesuatu tidak yakin, gunakan nilai null atau bahasa yang konservatif.
+Jika tidak yakin, gunakan null.
 
-Nilai apakah foto layak digunakan sebagai materi konten.
+PERHATIKAN SECARA KHUSUS:
 
-Berikan analisis dalam JSON VALID SAJA.
+1. Produk utama yang terlihat.
+2. Jenis ruangan/scene.
+3. Warna dominan.
+4. Gaya interior bila cukup jelas.
+5. Komposisi foto.
+6. Sudut pengambilan gambar.
+7. Pencahayaan.
+8. Distraksi visual.
+9. Proporsi ceiling/wall/floor.
+10. Seberapa jelas produk menjadi focal point.
+11. Kerapian hasil pemasangan yang terlihat.
+12. Potensi selling point.
+13. Kesesuaian dengan objective user.
+14. Kesesuaian dengan format konten.
+15. Apakah foto layak dipublikasikan.
 
-Jangan gunakan markdown.
-Jangan gunakan ```json.
-Jangan beri penjelasan di luar JSON.
-
-Gunakan struktur PERSIS berikut:
-
-{{
-  "scene": "string atau null",
-  "product": "string atau null",
-  "curtain_style": "string atau null",
-  "dominant_colors": [
-    "string"
-  ],
-  "room_style": "string atau null",
-  "visual_quality_score": 1,
-  "visual_strengths": [
-    "string"
-  ],
-  "visual_issues": [
-    "string"
-  ],
-  "selling_points": [
-    "string"
-  ],
-  "recommended_angle": "string",
-  "content_idea": "string",
-  "usable": true
-}}
-
-ATURAN SCORE:
+SCORING:
 
 1-3:
-Foto buruk / sulit dipakai.
+Tidak layak digunakan tanpa pengambilan
+foto ulang.
 
 4-5:
-Bisa dipakai tetapi membutuhkan perbaikan signifikan.
+Bisa digunakan tetapi membutuhkan
+perbaikan signifikan.
 
 6-7:
-Layak untuk konten.
+Layak digunakan sebagai konten.
 
 8-9:
-Sangat bagus.
+Sangat kuat untuk konten.
 
 10:
-Kualitas visual sangat kuat dan hampir siap publikasi.
+Kualitas visual sangat kuat dan hampir
+siap publikasi tanpa koreksi berarti.
 
 RECOMMENDED ANGLE:
 
-Pilih satu angle utama yang paling masuk akal dari foto,
-misalnya:
+Pilih SATU angle utama paling kuat:
+
 - showcase
 - edukasi
 - promo
@@ -354,71 +397,86 @@ misalnya:
 - trust
 - inspiration
 
+Jika objective user kurang cocok dengan foto,
+tetap catat objective user tetapi pilih angle
+visual yang menurutmu paling kuat.
+
 CONTENT IDEA:
 
-Berikan satu ide konten yang konkret dan relevan dengan foto,
-brand, format, dan objective yang dipilih user.
+Buat satu ide konten yang konkret.
+Jangan generik.
 
-Bahasa seluruh isi JSON: Bahasa Indonesia.
+Contoh buruk:
+"Posting hasil pemasangan gorden."
+
+Contoh lebih baik:
+"Showcase bagaimana kombinasi gorden utama
+berwarna netral dan vitrase putih membuat
+jendela terlihat lebih rapi dan berlapis."
+
+OUTPUT:
+
+Kembalikan JSON VALID SAJA.
+
+Tidak boleh menggunakan markdown.
+Tidak boleh menggunakan ```json.
+Tidak boleh menambahkan kalimat sebelum
+atau sesudah JSON.
+
+Gunakan struktur berikut:
+
+{{
+  "scene": "string atau null",
+  "product": "string atau null",
+  "curtain_style": "string atau null",
+
+  "dominant_colors": [
+    "string"
+  ],
+
+  "room_style": "string atau null",
+
+  "visual_quality_score": 1,
+
+  "visual_strengths": [
+    "string"
+  ],
+
+  "visual_issues": [
+    "string"
+  ],
+
+  "selling_points": [
+    "string"
+  ],
+
+  "recommended_angle": "string",
+
+  "content_idea": "string",
+
+  "usable": true
+}}
+
+Seluruh isi JSON harus menggunakan
+Bahasa Indonesia.
 """
 
 
-# ------------------------------------------------------------
-# OPENAI VISION
-# ------------------------------------------------------------
+# ============================================================
+# CLEAN MODEL OUTPUT
+# ============================================================
 
-def analyze_image(
-    image_bytes: bytes,
-    mime_type: str,
-    brand: str,
-    content_format: str,
-    objective: str,
+def clean_json_output(
+    output_text: str
 ) -> Dict[str, Any]:
-
-    encoded = base64.b64encode(
-        image_bytes
-    ).decode("utf-8")
-
-    data_url = (
-        f"data:{mime_type};base64,{encoded}"
-    )
-
-    prompt = build_analysis_prompt(
-        brand=brand,
-        content_format=content_format,
-        objective=objective,
-    )
-
-    response = openai_client.responses.create(
-        model=OPENAI_VISION_MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": prompt,
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": data_url,
-                        "detail": "high",
-                    },
-                ],
-            }
-        ],
-    )
-
-    output_text = response.output_text
 
     if not output_text:
         raise RuntimeError(
-            "OpenAI returned empty output_text"
+            "OpenAI returned empty output"
         )
 
     cleaned = output_text.strip()
 
-    # Defensive cleanup jika model tetap memberi markdown.
     if cleaned.startswith("```json"):
         cleaned = cleaned[7:]
 
@@ -431,49 +489,48 @@ def analyze_image(
     cleaned = cleaned.strip()
 
     try:
-        analysis = json.loads(cleaned)
+        data = json.loads(cleaned)
+
     except json.JSONDecodeError as exc:
+
+        logger.error(
+            "Invalid JSON returned by AI"
+        )
+
         raise RuntimeError(
             "OpenAI output is not valid JSON"
         ) from exc
 
-    if not isinstance(analysis, dict):
+    if not isinstance(
+        data,
+        dict
+    ):
         raise RuntimeError(
-            "OpenAI analysis must be a JSON object"
+            "AI output must be a JSON object"
         )
 
-    return {
-        "analysis": analysis,
-        "response_id": getattr(
-            response,
-            "id",
-            None,
-        ),
-        "model": getattr(
-            response,
-            "model",
-            OPENAI_VISION_MODEL,
-        ),
-        "usage": extract_usage(response),
-    }
+    return data
 
 
-# ------------------------------------------------------------
-# TOKEN USAGE
-# ------------------------------------------------------------
+# ============================================================
+# USAGE EXTRACTION
+# ============================================================
 
-def extract_usage(response) -> Dict[str, int]:
+def extract_usage(
+    response
+) -> Dict[str, int]:
+
     usage = getattr(
         response,
         "usage",
-        None,
+        None
     )
 
     if not usage:
         return {
             "input_tokens": 0,
             "output_tokens": 0,
-            "total_tokens": 0,
+            "total_tokens": 0
         }
 
     return {
@@ -481,36 +538,136 @@ def extract_usage(response) -> Dict[str, int]:
             getattr(
                 usage,
                 "input_tokens",
-                0,
-            )
-            or 0
+                0
+            ) or 0
         ),
+
         "output_tokens": int(
             getattr(
                 usage,
                 "output_tokens",
-                0,
-            )
-            or 0
+                0
+            ) or 0
         ),
+
         "total_tokens": int(
             getattr(
                 usage,
                 "total_tokens",
-                0,
-            )
-            or 0
-        ),
+                0
+            ) or 0
+        )
     }
 
 
-# ------------------------------------------------------------
-# DATABASE
-# ------------------------------------------------------------
+# ============================================================
+# OPENAI VISION
+# ============================================================
 
-def analysis_exists(job_id: str) -> bool:
+def analyze_image(
+    image_bytes: bytes,
+    mime_type: str,
+    brand: str,
+    content_format: str,
+    objective: str
+) -> Dict[str, Any]:
+
+    encoded_image = base64.b64encode(
+        image_bytes
+    ).decode("utf-8")
+
+    data_url = (
+        f"data:{mime_type};base64,"
+        f"{encoded_image}"
+    )
+
+    prompt = build_analysis_prompt(
+        brand=brand,
+        content_format=content_format,
+        objective=objective
+    )
+
+    logger.info(
+        "Calling OpenAI model=%s effort=%s",
+        OPENAI_VISION_MODEL,
+        OPENAI_REASONING_EFFORT
+    )
+
+    response = (
+        openai_client.responses.create(
+            model=OPENAI_VISION_MODEL,
+
+            reasoning={
+                "effort":
+                    OPENAI_REASONING_EFFORT
+            },
+
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type":
+                                "input_text",
+                            "text":
+                                prompt
+                        },
+                        {
+                            "type":
+                                "input_image",
+                            "image_url":
+                                data_url,
+                            "detail":
+                                "high"
+                        }
+                    ]
+                }
+            ]
+        )
+    )
+
+    analysis = clean_json_output(
+        response.output_text
+    )
+
+    usage = extract_usage(
+        response
+    )
+
+    return {
+        "analysis":
+            analysis,
+
+        "response_id":
+            getattr(
+                response,
+                "id",
+                None
+            ),
+
+        "model":
+            getattr(
+                response,
+                "model",
+                OPENAI_VISION_MODEL
+            ),
+
+        "usage":
+            usage
+    }
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def analysis_exists(
+    job_id: str
+) -> bool:
+
     with psycopg.connect(
-        DATABASE_URL
+        DATABASE_URL,
+        connect_timeout=5
     ) as conn:
 
         with conn.cursor() as cur:
@@ -522,20 +679,24 @@ def analysis_exists(job_id: str) -> bool:
                 WHERE job_id = %s
                 LIMIT 1
                 """,
-                (job_id,),
+                (job_id,)
             )
 
-            return cur.fetchone() is not None
+            return (
+                cur.fetchone()
+                is not None
+            )
 
 
 def save_analysis(
     job_id: str,
     model: str,
-    analysis: Dict[str, Any],
+    analysis: Dict[str, Any]
 ) -> None:
 
     with psycopg.connect(
-        DATABASE_URL
+        DATABASE_URL,
+        connect_timeout=5
     ) as conn:
 
         with conn.cursor() as cur:
@@ -558,21 +719,21 @@ def save_analysis(
                     model,
                     json.dumps(
                         analysis,
-                        ensure_ascii=False,
-                    ),
-                ),
+                        ensure_ascii=False
+                    )
+                )
             )
 
         conn.commit()
 
 
-# ------------------------------------------------------------
-# TELEGRAM RESULT
-# ------------------------------------------------------------
+# ============================================================
+# TELEGRAM RESULT FORMATTER
+# ============================================================
 
 def format_analysis_message(
     analysis: Dict[str, Any],
-    content_format: str,
+    content_format: str
 ) -> str:
 
     score = analysis.get(
@@ -597,22 +758,32 @@ def format_analysis_message(
 
     usable = analysis.get(
         "usable",
-        False,
+        False
     )
 
     selling_points = analysis.get(
         "selling_points",
-        [],
+        []
     )
 
     issues = analysis.get(
         "visual_issues",
-        [],
+        []
+    )
+
+    strengths = analysis.get(
+        "visual_strengths",
+        []
     )
 
     selling_text = "\n".join(
         f"• {item}"
         for item in selling_points[:3]
+    )
+
+    strength_text = "\n".join(
+        f"• {item}"
+        for item in strengths[:3]
     )
 
     issue_text = "\n".join(
@@ -623,8 +794,14 @@ def format_analysis_message(
     if not selling_text:
         selling_text = "• -"
 
+    if not strength_text:
+        strength_text = "• -"
+
     if not issue_text:
-        issue_text = "• Tidak ada masalah utama terdeteksi"
+        issue_text = (
+            "• Tidak ada masalah visual "
+            "utama terdeteksi"
+        )
 
     usable_text = (
         "LAYAK"
@@ -633,26 +810,40 @@ def format_analysis_message(
     )
 
     return (
-        "🧠 AI selesai menganalisis foto.\n\n"
+        "🧠 AI selesai menganalisis foto."
+        "\n\n"
+
         f"🪟 Produk: {product}\n"
         f"⭐ Asset Quality: {score}/10\n"
         f"✅ Status aset: {usable_text}\n"
         f"🎯 Angle: {angle}\n"
-        f"📱 Format: {content_format}\n\n"
+        f"📱 Format: {content_format}"
+
+        "\n\n"
+        "✨ Kekuatan visual:\n"
+        f"{strength_text}"
+
+        "\n\n"
         "💎 Selling point:\n"
-        f"{selling_text}\n\n"
+        f"{selling_text}"
+
+        "\n\n"
         "⚠️ Catatan visual:\n"
-        f"{issue_text}\n\n"
+        f"{issue_text}"
+
+        "\n\n"
         "💡 Ide konten:\n"
-        f"{idea}\n\n"
-        "Foto sudah dianalisis dan hasilnya "
-        "tersimpan di Content Machine."
+        f"{idea}"
+
+        "\n\n"
+        "Hasil analisis sudah tersimpan "
+        "di Content Machine."
     )
 
 
-# ------------------------------------------------------------
-# QUEUE PAYLOAD VALIDATION
-# ------------------------------------------------------------
+# ============================================================
+# TASK VALIDATION
+# ============================================================
 
 def validate_task(
     task: Dict[str, Any]
@@ -661,7 +852,7 @@ def validate_task(
     required = [
         "job_id",
         "chat_id",
-        "file_path",
+        "file_path"
     ]
 
     missing = [
@@ -679,15 +870,17 @@ def validate_task(
     return task
 
 
-# ------------------------------------------------------------
-# PROCESS ONE JOB
-# ------------------------------------------------------------
+# ============================================================
+# PROCESS TASK
+# ============================================================
 
 def process_task(
     task: Dict[str, Any]
 ) -> None:
 
-    task = validate_task(task)
+    task = validate_task(
+        task
+    )
 
     job_id = str(
         task["job_id"]
@@ -704,69 +897,98 @@ def process_task(
     brand = str(
         task.get(
             "brand",
-            "UNKNOWN",
+            "UNKNOWN"
         )
     ).upper()
 
     content_format = str(
         task.get(
             "format",
-            "UNKNOWN",
+            "UNKNOWN"
         )
     ).upper()
 
     objective = str(
         task.get(
             "objective",
-            "AI_AUTO",
+            "AUTO"
         )
     ).upper()
 
     mime_hint = str(
         task.get(
             "mime_type",
-            "image/jpeg",
+            "image/jpeg"
         )
     )
 
     logger.info(
-        "Processing job=%s brand=%s format=%s objective=%s",
+        (
+            "Processing job=%s "
+            "brand=%s format=%s "
+            "objective=%s"
+        ),
         job_id,
         brand,
         content_format,
-        objective,
+        objective
     )
 
-    # Idempotency guard.
-    if analysis_exists(job_id):
+    # --------------------------------------------------------
+    # IDEMPOTENCY
+    # --------------------------------------------------------
+
+    if analysis_exists(
+        job_id
+    ):
 
         logger.warning(
-            "Analysis already exists job=%s. Skipping duplicate.",
-            job_id,
+            (
+                "Analysis already exists "
+                "job=%s. Duplicate skipped."
+            ),
+            job_id
         )
 
         return
 
+    # --------------------------------------------------------
+    # USER STATUS
+    # --------------------------------------------------------
+
     send_message(
         chat_id,
-        "🧠 AI sedang menganalisis foto...",
+        (
+            "🧠 AI sedang menganalisis foto "
+            "dengan Astra..."
+        )
     )
 
-    image_bytes = download_telegram_image(
-        file_path
+    # --------------------------------------------------------
+    # DOWNLOAD
+    # --------------------------------------------------------
+
+    image_bytes = (
+        download_telegram_image(
+            file_path
+        )
     )
 
     mime_type = detect_mime_type(
         image_bytes,
-        mime_hint,
+        mime_hint
     )
+
+    # --------------------------------------------------------
+    # AI
+    # --------------------------------------------------------
 
     result = analyze_image(
         image_bytes=image_bytes,
         mime_type=mime_type,
         brand=brand,
         content_format=content_format,
-        objective=objective,
+        objective=objective
     )
 
     analysis = result[
@@ -781,73 +1003,111 @@ def process_task(
         "usage"
     ]
 
-    # Simpan metadata AI bersama analysis JSONB.
-    # Tidak perlu migrasi tabel baru pada V1.4.
+    # --------------------------------------------------------
+    # STORE AI METADATA
+    # --------------------------------------------------------
+
     stored_analysis = dict(
         analysis
     )
 
     stored_analysis["_meta"] = {
-        "response_id": result.get(
-            "response_id"
-        ),
-        "input_tokens": usage.get(
-            "input_tokens",
-            0,
-        ),
-        "output_tokens": usage.get(
-            "output_tokens",
-            0,
-        ),
-        "total_tokens": usage.get(
-            "total_tokens",
-            0,
-        ),
-        "worker_version": "1.4.0",
+        "response_id":
+            result.get(
+                "response_id"
+            ),
+
+        "model":
+            model,
+
+        "reasoning_effort":
+            OPENAI_REASONING_EFFORT,
+
+        "image_detail":
+            "high",
+
+        "input_tokens":
+            usage.get(
+                "input_tokens",
+                0
+            ),
+
+        "output_tokens":
+            usage.get(
+                "output_tokens",
+                0
+            ),
+
+        "total_tokens":
+            usage.get(
+                "total_tokens",
+                0
+            ),
+
+        "worker_version":
+            "1.4.1"
     }
+
+    # --------------------------------------------------------
+    # DATABASE
+    # --------------------------------------------------------
 
     save_analysis(
         job_id=job_id,
         model=model,
-        analysis=stored_analysis,
+        analysis=stored_analysis
     )
 
     logger.info(
-        "Analysis saved job=%s model=%s tokens=%s",
+        (
+            "Analysis saved "
+            "job=%s model=%s tokens=%s"
+        ),
         job_id,
         model,
         usage.get(
             "total_tokens",
-            0,
-        ),
+            0
+        )
     )
+
+    # --------------------------------------------------------
+    # RESULT TO USER
+    # --------------------------------------------------------
 
     send_message(
         chat_id,
         format_analysis_message(
             analysis=analysis,
-            content_format=content_format,
-        ),
+            content_format=content_format
+        )
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # WORKER LOOP
-# ------------------------------------------------------------
+# ============================================================
 
-def run_worker() -> None:
+def run_worker():
 
     logger.info(
-        "SCG Content Machine AI Worker V1.4 starting"
+        (
+            "SCG Content Machine "
+            "AI Worker V1.4.1 starting"
+        )
     )
 
     logger.info(
-        "Model=%s Queue=%s",
+        (
+            "Model=%s "
+            "Reasoning=%s "
+            "Queue=%s"
+        ),
         OPENAI_VISION_MODEL,
-        QUEUE_NAME,
+        OPENAI_REASONING_EFFORT,
+        QUEUE_NAME
     )
 
-    # Fail fast kalau Redis tidak dapat dijangkau.
     redis_client.ping()
 
     logger.info(
@@ -857,10 +1117,10 @@ def run_worker() -> None:
     while True:
 
         try:
-            # BLPOP menunggu tanpa polling agresif.
+
             item = redis_client.blpop(
                 QUEUE_NAME,
-                timeout=30,
+                timeout=30
             )
 
             if not item:
@@ -868,26 +1128,41 @@ def run_worker() -> None:
 
             _, raw_payload = item
 
+            # ------------------------------------------------
+            # PARSE QUEUE PAYLOAD
+            # ------------------------------------------------
+
             try:
+
                 task = json.loads(
                     raw_payload
                 )
 
                 if not isinstance(
                     task,
-                    dict,
+                    dict
                 ):
                     raise ValueError(
-                        "Queue payload must be JSON object"
+                        (
+                            "Queue payload must "
+                            "be a JSON object"
+                        )
                     )
 
             except Exception:
+
                 logger.exception(
                     "Invalid queue payload"
                 )
+
                 continue
 
+            # ------------------------------------------------
+            # PROCESS
+            # ------------------------------------------------
+
             try:
+
                 process_task(
                     task
                 )
@@ -896,7 +1171,7 @@ def run_worker() -> None:
 
                 job_id = task.get(
                     "job_id",
-                    "UNKNOWN",
+                    "UNKNOWN"
                 )
 
                 chat_id = task.get(
@@ -905,28 +1180,49 @@ def run_worker() -> None:
 
                 logger.exception(
                     "Analysis failed job=%s",
-                    job_id,
+                    job_id
                 )
 
-                # Simpan error sederhana di Redis.
-                # TTL 7 hari.
+                # --------------------------------------------
+                # ERROR LEDGER IN REDIS
+                # --------------------------------------------
+
                 try:
+
                     redis_client.setex(
-                        f"contentmachine:analysis_error:{job_id}",
+                        (
+                            "contentmachine:"
+                            "analysis_error:"
+                            f"{job_id}"
+                        ),
                         604800,
-                        str(exc)[:2000],
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed recording error in Redis"
+                        str(exc)[:2000]
                     )
 
+                except Exception:
+
+                    logger.exception(
+                        (
+                            "Failed recording "
+                            "analysis error"
+                        )
+                    )
+
+                # --------------------------------------------
+                # USER NOTIFICATION
+                # --------------------------------------------
+
                 if chat_id:
+
                     send_message(
                         int(chat_id),
-                        "⚠️ Analisis AI belum berhasil.\n\n"
-                        "Foto tetap aman tercatat di Content Machine. "
-                        "Silakan coba proses ulang setelah sistem diperiksa.",
+                        (
+                            "⚠️ Analisis AI belum berhasil."
+                            "\n\n"
+                            "Foto tetap aman tercatat "
+                            "di Content Machine.\n"
+                            f"🆔 Job: {job_id}"
+                        )
                     )
 
         except redis.exceptions.RedisError:
@@ -939,7 +1235,6 @@ def run_worker() -> None:
 
         except Exception:
 
-            # Worker jangan mati karena satu error tak terduga.
             logger.exception(
                 "Unexpected worker loop error"
             )
@@ -947,9 +1242,9 @@ def run_worker() -> None:
             time.sleep(5)
 
 
-# ------------------------------------------------------------
+# ============================================================
 # ENTRYPOINT
-# ------------------------------------------------------------
+# ============================================================
 
 if __name__ == "__main__":
     run_worker()
