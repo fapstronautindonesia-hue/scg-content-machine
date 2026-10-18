@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI(
     title="SCG Content Machine",
-    version="1.3.0"
+    version="1.4.0"
 )
 
 
@@ -29,12 +29,16 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
 
-# Session brief berlaku 1 jam.
 SESSION_TTL = 3600
+
+AI_ANALYSIS_QUEUE = os.getenv(
+    "AI_ANALYSIS_QUEUE",
+    "contentmachine:analysis_queue"
+)
 
 
 # =========================================================
-# REDIS / SESSION
+# REDIS
 # =========================================================
 
 def get_redis():
@@ -48,6 +52,10 @@ def get_redis():
         socket_timeout=5
     )
 
+
+# =========================================================
+# SESSION
+# =========================================================
 
 def session_key(chat_id):
     return f"content_session:{chat_id}"
@@ -80,6 +88,46 @@ def delete_session(chat_id):
 
 
 # =========================================================
+# AI ANALYSIS QUEUE
+# =========================================================
+
+def enqueue_analysis(
+    job_id,
+    chat_id,
+    file_path,
+    brand,
+    content_format,
+    objective,
+    mime_type="image/jpeg"
+):
+    """
+    Masukkan task ke Redis.
+
+    Webhook TIDAK menjalankan AI secara langsung.
+    Worker V1.4 akan mengambil task ini secara asynchronous.
+    """
+
+    client = get_redis()
+
+    task = {
+        "job_id": str(job_id),
+        "chat_id": int(chat_id),
+        "file_path": file_path,
+        "brand": brand,
+        "format": content_format,
+        "objective": objective,
+        "mime_type": mime_type
+    }
+
+    client.rpush(
+        AI_ANALYSIS_QUEUE,
+        json.dumps(task)
+    )
+
+    return task
+
+
+# =========================================================
 # TELEGRAM HELPERS
 # =========================================================
 
@@ -87,7 +135,10 @@ def telegram_api(method: str, payload: dict):
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/{method}"
+    )
 
     response = requests.post(
         url,
@@ -97,7 +148,14 @@ def telegram_api(method: str, payload: dict):
 
     response.raise_for_status()
 
-    return response.json()
+    data = response.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(
+            f"Telegram API error on {method}"
+        )
+
+    return data
 
 
 def send_message(chat_id, text, reply_markup=None):
@@ -116,13 +174,11 @@ def send_message(chat_id, text, reply_markup=None):
 
 
 def answer_callback_query(callback_query_id):
-    payload = {
-        "callback_query_id": callback_query_id
-    }
-
     return telegram_api(
         "answerCallbackQuery",
-        payload
+        {
+            "callback_query_id": callback_query_id
+        }
     )
 
 
@@ -164,9 +220,9 @@ def create_job_and_asset(
     job_id = uuid.uuid4()
     asset_id = uuid.uuid4()
 
-    # Dipakai untuk mencegah Telegram webhook retry
-    # membuat job yang sama dua kali.
-    external_id = f"telegram:{chat_id}:{message_id}"
+    external_id = (
+        f"telegram:{chat_id}:{message_id}"
+    )
 
     with psycopg.connect(
         DATABASE_URL,
@@ -175,9 +231,9 @@ def create_job_and_asset(
 
         with conn.cursor() as cur:
 
-            # =================================================
+            # -------------------------------------------------
             # CREATE JOB
-            # =================================================
+            # -------------------------------------------------
 
             cur.execute(
                 """
@@ -216,9 +272,9 @@ def create_job_and_asset(
 
             inserted_job = cur.fetchone()
 
-            # =================================================
+            # -------------------------------------------------
             # DUPLICATE PROTECTION
-            # =================================================
+            # -------------------------------------------------
 
             if not inserted_job:
 
@@ -237,21 +293,27 @@ def create_job_and_asset(
 
                 if not existing_job:
                     raise RuntimeError(
-                        "Duplicate detected but existing job not found"
+                        "Duplicate detected but "
+                        "existing job not found"
                     )
 
                 return str(existing_job[0]), False
 
-            # =================================================
+            # -------------------------------------------------
             # CREATE ASSET
-            # =================================================
+            # -------------------------------------------------
 
             metadata = {
-                "telegram_file_id": telegram_file_id,
-                "telegram_file_unique_id": telegram_file_unique_id,
-                "telegram_file_path": telegram_file_path,
-                "telegram_chat_id": chat_id,
-                "telegram_message_id": message_id
+                "telegram_file_id":
+                    telegram_file_id,
+                "telegram_file_unique_id":
+                    telegram_file_unique_id,
+                "telegram_file_path":
+                    telegram_file_path,
+                "telegram_chat_id":
+                    chat_id,
+                "telegram_message_id":
+                    message_id
             }
 
             original_filename = (
@@ -307,7 +369,7 @@ def root():
     return {
         "system": "SCG Content Machine",
         "status": "ONLINE",
-        "version": "1.3.0"
+        "version": "1.4.0"
     }
 
 
@@ -321,12 +383,7 @@ def health():
     database_status = "disconnected"
     redis_status = "disconnected"
 
-    # -----------------------------------------------------
-    # POSTGRESQL
-    # -----------------------------------------------------
-
     try:
-
         if not DATABASE_URL:
             raise RuntimeError(
                 "DATABASE_URL is missing"
@@ -338,48 +395,28 @@ def health():
         ) as conn:
 
             with conn.cursor() as cur:
-
-                cur.execute(
-                    "SELECT 1"
-                )
-
+                cur.execute("SELECT 1")
                 cur.fetchone()
 
         database_status = "connected"
 
     except Exception as exc:
-
         print(
             "DATABASE HEALTH ERROR:",
             repr(exc)
         )
 
-        database_status = "disconnected"
-
-    # -----------------------------------------------------
-    # REDIS
-    # -----------------------------------------------------
-
     try:
-
         client = get_redis()
-
         client.ping()
 
         redis_status = "connected"
 
     except Exception as exc:
-
         print(
             "REDIS HEALTH ERROR:",
             repr(exc)
         )
-
-        redis_status = "disconnected"
-
-    # -----------------------------------------------------
-    # RESULT
-    # -----------------------------------------------------
 
     healthy = (
         database_status == "connected"
@@ -387,13 +424,12 @@ def health():
     )
 
     payload = {
-        "status": (
+        "status":
             "healthy"
             if healthy
-            else "unhealthy"
-        ),
+            else "unhealthy",
         "service": "content-machine",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "database": database_status,
         "redis": redis_status
     }
@@ -425,7 +461,6 @@ async def telegram_webhook(
     # =====================================================
 
     if not TELEGRAM_WEBHOOK_SECRET:
-
         raise HTTPException(
             status_code=500,
             detail=(
@@ -438,7 +473,6 @@ async def telegram_webhook(
         x_telegram_bot_api_secret_token
         != TELEGRAM_WEBHOOK_SECRET
     ):
-
         raise HTTPException(
             status_code=403,
             detail="Invalid webhook secret"
@@ -447,13 +481,11 @@ async def telegram_webhook(
     update = await request.json()
 
     print(
-        "TELEGRAM UPDATE:",
-        update
+        "TELEGRAM UPDATE RECEIVED"
     )
 
-
     # =====================================================
-    # CALLBACK QUERY / BUTTON
+    # CALLBACK QUERY
     # =====================================================
 
     callback_query = update.get(
@@ -486,28 +518,21 @@ async def telegram_webhook(
         )
 
         if callback_id:
-
             try:
                 answer_callback_query(
                     callback_id
                 )
-
             except Exception as exc:
-
                 print(
                     "CALLBACK ANSWER ERROR:",
                     repr(exc)
                 )
 
         if not callback_chat_id:
-
-            return {
-                "ok": True
-            }
-
+            return {"ok": True}
 
         # =================================================
-        # BRAND: SCG
+        # BRAND SCG
         # =================================================
 
         if callback_data == "brand:SCG":
@@ -548,9 +573,8 @@ async def telegram_webhook(
                 format_keyboard
             )
 
-
         # =================================================
-        # BRAND: ILMI
+        # BRAND ILMI
         # =================================================
 
         elif callback_data == "brand:ILMI":
@@ -591,23 +615,19 @@ async def telegram_webhook(
                 format_keyboard
             )
 
-
         # =================================================
-        # FORMAT SELECTED
+        # FORMAT
         # =================================================
 
         elif callback_data.startswith(
             "format:"
         ):
 
-            parts = callback_data.split(
-                ":"
-            )
+            parts = callback_data.split(":")
 
             if len(parts) == 3:
 
                 brand = parts[1]
-
                 content_format = parts[2]
 
                 objective_keyboard = {
@@ -686,30 +706,21 @@ async def telegram_webhook(
                     objective_keyboard
                 )
 
-
         # =================================================
-        # OBJECTIVE SELECTED
+        # OBJECTIVE
         # =================================================
 
         elif callback_data.startswith(
             "objective:"
         ):
 
-            parts = callback_data.split(
-                ":"
-            )
+            parts = callback_data.split(":")
 
             if len(parts) == 4:
 
                 brand = parts[1]
-
                 content_format = parts[2]
-
                 objective = parts[3]
-
-                # -----------------------------------------
-                # SAVE BRIEF INTO REDIS
-                # -----------------------------------------
 
                 save_session(
                     callback_chat_id,
@@ -739,45 +750,31 @@ async def telegram_webhook(
                     )
                 )
 
-        return {
-            "ok": True
-        }
-
+        return {"ok": True}
 
     # =====================================================
     # NORMAL MESSAGE
     # =====================================================
 
-    message = update.get(
-        "message"
-    )
+    message = update.get("message")
 
     if not message:
-
-        return {
-            "ok": True
-        }
+        return {"ok": True}
 
     chat = message.get(
         "chat",
         {}
     )
 
-    chat_id = chat.get(
-        "id"
-    )
+    chat_id = chat.get("id")
 
     if not chat_id:
-
-        return {
-            "ok": True
-        }
+        return {"ok": True}
 
     text = message.get(
         "text",
         ""
     )
-
 
     # =====================================================
     # /START
@@ -785,15 +782,10 @@ async def telegram_webhook(
 
     if text == "/start":
 
-        # Hapus session lama agar brief tidak tertukar.
         try:
-
-            delete_session(
-                chat_id
-            )
+            delete_session(chat_id)
 
         except Exception as exc:
-
             print(
                 "SESSION RESET ERROR:",
                 repr(exc)
@@ -827,33 +819,26 @@ async def telegram_webhook(
             brand_keyboard
         )
 
-        return {
-            "ok": True
-        }
-
+        return {"ok": True}
 
     # =====================================================
     # PHOTO RECEIVED
     # =====================================================
 
-    photos = message.get(
-        "photo"
-    )
+    photos = message.get("photo")
 
     if photos:
 
-        # ---------------------------------------------
-        # LOAD CONTENT BRIEF
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # LOAD SESSION
+        # -------------------------------------------------
 
         try:
-
             session = get_session(
                 chat_id
             )
 
         except Exception as exc:
-
             print(
                 "SESSION READ ERROR:",
                 repr(exc)
@@ -864,13 +849,12 @@ async def telegram_webhook(
                 (
                     "❌ Sistem gagal membaca brief "
                     "konten.\n\n"
-                    "Silakan ketik /start dan coba lagi."
+                    "Silakan ketik /start "
+                    "dan coba lagi."
                 )
             )
 
-            return {
-                "ok": True
-            }
+            return {"ok": True}
 
         if not session:
 
@@ -884,9 +868,7 @@ async def telegram_webhook(
                 )
             )
 
-            return {
-                "ok": True
-            }
+            return {"ok": True}
 
         if (
             session.get("status")
@@ -902,13 +884,11 @@ async def telegram_webhook(
                 )
             )
 
-            return {
-                "ok": True
-            }
+            return {"ok": True}
 
-        # ---------------------------------------------
-        # GET HIGHEST RESOLUTION TELEGRAM PHOTO
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # HIGHEST RESOLUTION PHOTO
+        # -------------------------------------------------
 
         photo = photos[-1]
 
@@ -930,14 +910,11 @@ async def telegram_webhook(
                 )
             )
 
-            return {
-                "ok": True
-            }
+            return {"ok": True}
 
-
-        # ---------------------------------------------
-        # TELEGRAM GET FILE + DATABASE
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # GET TELEGRAM FILE + DATABASE
+        # -------------------------------------------------
 
         try:
 
@@ -952,7 +929,6 @@ async def telegram_webhook(
             )
 
             if not telegram_file_path:
-
                 raise RuntimeError(
                     "Telegram file_path is missing"
                 )
@@ -978,11 +954,15 @@ async def telegram_webhook(
                 )
             )
 
-            # -----------------------------------------
+            # =================================================
             # NEW JOB
-            # -----------------------------------------
+            # =================================================
 
             if created:
+
+                # ---------------------------------------------
+                # ACKNOWLEDGE INGESTION FIRST
+                # ---------------------------------------------
 
                 send_message(
                     chat_id,
@@ -998,17 +978,63 @@ async def telegram_webhook(
                         f"{session['objective']}"
                         "\n\n"
                         "🧠 Foto sudah masuk ke "
-                        "Content Machine."
+                        "Content Machine.\n"
+                        "AI akan menganalisis foto."
                     )
                 )
 
+                # ---------------------------------------------
+                # AI QUEUE
+                # ---------------------------------------------
+
+                try:
+
+                    enqueue_analysis(
+                        job_id=job_id,
+                        chat_id=chat_id,
+                        file_path=telegram_file_path,
+                        brand=session["brand"],
+                        content_format=session["format"],
+                        objective=session["objective"],
+                        mime_type="image/jpeg"
+                    )
+
+                    print(
+                        "AI ANALYSIS ENQUEUED:",
+                        job_id
+                    )
+
+                except Exception as queue_exc:
+
+                    # PENTING:
+                    # Job + asset sudah committed.
+                    # Queue gagal TIDAK boleh membuat
+                    # user mengira foto gagal disimpan.
+
+                    print(
+                        "AI QUEUE ERROR:",
+                        job_id,
+                        repr(queue_exc)
+                    )
+
+                    send_message(
+                        chat_id,
+                        (
+                            "⚠️ Foto sudah aman tersimpan, "
+                            "tetapi antrean analisis AI "
+                            "belum berhasil dibuat.\n\n"
+                            f"🆔 Job: {job_id}"
+                        )
+                    )
+
+                # Session dihapus setelah ingestion selesai.
                 delete_session(
                     chat_id
                 )
 
-            # -----------------------------------------
+            # =================================================
             # DUPLICATE
-            # -----------------------------------------
+            # =================================================
 
             else:
 
@@ -1021,9 +1047,7 @@ async def telegram_webhook(
                     )
                 )
 
-            return {
-                "ok": True
-            }
+            return {"ok": True}
 
         except Exception as exc:
 
@@ -1042,10 +1066,7 @@ async def telegram_webhook(
                 )
             )
 
-            return {
-                "ok": True
-            }
-
+            return {"ok": True}
 
     # =====================================================
     # DEFAULT
@@ -1056,6 +1077,4 @@ async def telegram_webhook(
         "Ketik /start untuk memulai Content Machine."
     )
 
-    return {
-        "ok": True
-    }
+    return {"ok": True}
