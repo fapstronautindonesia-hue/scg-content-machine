@@ -206,3 +206,30 @@ async def telegram_webhook(
     )
 
     return {"ok": True}
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None)
+):
+    webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+
+    if not webhook_secret:
+        raise HTTPException(
+            status_code=500,
+            detail="TELEGRAM_WEBHOOK_SECRET is missing"
+        )
+
+    if x_telegram_bot_api_secret_token != webhook_secret:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid webhook secret"
+        )
+
+    update = await request.json()
+
+    print("TELEGRAM UPDATE:", update)
+
+    return {
+        "ok": True,
+        "received": True
+    }
