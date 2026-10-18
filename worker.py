@@ -13,8 +13,15 @@ from openai import OpenAI
 
 # ============================================================
 # SCG CONTENT MACHINE
-# V1.4.1 — AI VISION ANALYZER
+# V1.4.2 — AI VISION ANALYZER
 # GPT-6 ASTRA / MAX REASONING
+#
+# CHANGE FROM V1.4.1:
+# - Preserve working Vision Analyzer
+# - Add Telegram action after successful analysis:
+#       [✨ Buat Konten]
+#       [🔄 Mulai Baru]
+# - Content generation is NOT executed here.
 # ============================================================
 
 
@@ -110,8 +117,13 @@ def telegram_api(
     payload: Dict[str, Any]
 ) -> Dict[str, Any]:
 
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is missing"
+        )
+
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/{method}"
     )
 
@@ -135,21 +147,27 @@ def telegram_api(
 
 def send_message(
     chat_id: int,
-    text: str
+    text: str,
+    reply_markup=None
 ) -> None:
+
+    payload = {
+        "chat_id": chat_id,
+        "text": text
+    }
+
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
     try:
         telegram_api(
             "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text
-            }
+            payload
         )
 
     except Exception:
         # Telegram notification failure must NOT
-        # roll back a completed AI analysis.
+        # roll back completed AI analysis.
         logger.exception(
             "Telegram send failed chat_id=%s",
             chat_id
@@ -172,7 +190,7 @@ def download_telegram_image(
     # Never log this URL because it contains
     # the Telegram bot token.
     url = (
-        f"https://api.telegram.org/file/"
+        "https://api.telegram.org/file/"
         f"bot{TELEGRAM_BOT_TOKEN}/{file_path}"
     )
 
@@ -841,6 +859,30 @@ def format_analysis_message(
     )
 
 
+def content_action_keyboard(
+    job_id: str
+) -> Dict[str, Any]:
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "✨ Buat Konten",
+                    "callback_data":
+                        f"content:create:{job_id}"
+                }
+            ],
+            [
+                {
+                    "text": "🔄 Mulai Baru",
+                    "callback_data":
+                        "content:restart"
+                }
+            ]
+        ]
+    }
+
+
 # ============================================================
 # TASK VALIDATION
 # ============================================================
@@ -1045,7 +1087,7 @@ def process_task(
             ),
 
         "worker_version":
-            "1.4.1"
+            "1.4.2"
     }
 
     # --------------------------------------------------------
@@ -1072,7 +1114,7 @@ def process_task(
     )
 
     # --------------------------------------------------------
-    # RESULT TO USER
+    # RESULT + CONTENT ACTION
     # --------------------------------------------------------
 
     send_message(
@@ -1080,6 +1122,9 @@ def process_task(
         format_analysis_message(
             analysis=analysis,
             content_format=content_format
+        ),
+        reply_markup=content_action_keyboard(
+            job_id
         )
     )
 
@@ -1093,7 +1138,7 @@ def run_worker():
     logger.info(
         (
             "SCG Content Machine "
-            "AI Worker V1.4.1 starting"
+            "AI Worker V1.4.2 starting"
         )
     )
 
@@ -1128,10 +1173,6 @@ def run_worker():
 
             _, raw_payload = item
 
-            # ------------------------------------------------
-            # PARSE QUEUE PAYLOAD
-            # ------------------------------------------------
-
             try:
 
                 task = json.loads(
@@ -1157,10 +1198,6 @@ def run_worker():
 
                 continue
 
-            # ------------------------------------------------
-            # PROCESS
-            # ------------------------------------------------
-
             try:
 
                 process_task(
@@ -1183,10 +1220,6 @@ def run_worker():
                     job_id
                 )
 
-                # --------------------------------------------
-                # ERROR LEDGER IN REDIS
-                # --------------------------------------------
-
                 try:
 
                     redis_client.setex(
@@ -1207,10 +1240,6 @@ def run_worker():
                             "analysis error"
                         )
                     )
-
-                # --------------------------------------------
-                # USER NOTIFICATION
-                # --------------------------------------------
 
                 if chat_id:
 
