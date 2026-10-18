@@ -1,3 +1,10 @@
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import JSONResponse
+
+app = FastAPI(
+    title="SCG Content Machine",
+    version="1.4.0"
+)
 import os
 import json
 import time
