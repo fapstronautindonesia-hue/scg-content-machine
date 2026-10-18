@@ -1,4 +1,6 @@
 import os
+import json
+import uuid
 
 import psycopg
 import redis
@@ -14,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI(
     title="SCG Content Machine",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 
@@ -24,6 +26,56 @@ app = FastAPI(
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_URL = os.getenv("REDIS_URL")
+
+SESSION_TTL = 3600
+
+
+# =========================================================
+# REDIS
+# =========================================================
+
+def get_redis():
+    if not REDIS_URL:
+        raise RuntimeError("REDIS_URL is missing")
+
+    return redis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5
+    )
+
+
+def session_key(chat_id):
+    return f"content_session:{chat_id}"
+
+
+def save_session(chat_id, data):
+    client = get_redis()
+
+    client.setex(
+        session_key(chat_id),
+        SESSION_TTL,
+        json.dumps(data)
+    )
+
+
+def get_session(chat_id):
+    client = get_redis()
+
+    raw = client.get(session_key(chat_id))
+
+    if not raw:
+        return None
+
+    return json.loads(raw)
+
+
+def delete_session(chat_id):
+    client = get_redis()
+    client.delete(session_key(chat_id))
 
 
 # =========================================================
@@ -67,6 +119,154 @@ def answer_callback_query(callback_query_id):
     return telegram_api("answerCallbackQuery", payload)
 
 
+def get_telegram_file(file_id):
+    result = telegram_api(
+        "getFile",
+        {
+            "file_id": file_id
+        }
+    )
+
+    return result["result"]
+
+
+# =========================================================
+# DATABASE HELPERS
+# =========================================================
+
+def create_job_and_asset(
+    chat_id,
+    message_id,
+    brand,
+    content_format,
+    objective,
+    telegram_file_id,
+    telegram_file_unique_id,
+    telegram_file_path
+):
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing")
+
+    job_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+
+    external_id = f"telegram:{chat_id}:{message_id}"
+
+    with psycopg.connect(DATABASE_URL) as conn:
+
+        with conn.cursor() as cur:
+
+            # -------------------------------------------------
+            # JOB
+            # -------------------------------------------------
+
+            cur.execute(
+                """
+                INSERT INTO jobs (
+                    id,
+                    source,
+                    external_id,
+                    brand,
+                    format,
+                    objective,
+                    status,
+                    requested_by
+                )
+                VALUES (
+                    %s,
+                    'telegram',
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    'RECEIVED',
+                    %s
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING id
+                """,
+                (
+                    job_id,
+                    external_id,
+                    brand,
+                    content_format,
+                    objective,
+                    str(chat_id)
+                )
+            )
+
+            inserted_job = cur.fetchone()
+
+            # Duplicate Telegram delivery / webhook retry
+            if not inserted_job:
+
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM jobs
+                    WHERE source = 'telegram'
+                    AND external_id = %s
+                    LIMIT 1
+                    """,
+                    (external_id,)
+                )
+
+                existing = cur.fetchone()
+
+                if not existing:
+                    raise RuntimeError(
+                        "Duplicate job detected but existing job not found"
+                    )
+
+                return str(existing[0]), False
+
+            # -------------------------------------------------
+            # ASSET
+            # -------------------------------------------------
+
+            cur.execute(
+                """
+                INSERT INTO assets (
+                    id,
+                    job_id,
+                    asset_type,
+                    source,
+                    external_id,
+                    storage_url,
+                    metadata
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'IMAGE',
+                    'telegram',
+                    %s,
+                    %s,
+                    %s
+                )
+                """,
+                (
+                    asset_id,
+                    job_id,
+                    telegram_file_unique_id,
+                    telegram_file_path,
+                    json.dumps(
+                        {
+                            "telegram_file_id": telegram_file_id,
+                            "telegram_file_unique_id": telegram_file_unique_id,
+                            "telegram_file_path": telegram_file_path,
+                            "chat_id": chat_id,
+                            "message_id": message_id
+                        }
+                    )
+                )
+            )
+
+        conn.commit()
+
+    return str(job_id), True
+
+
 # =========================================================
 # ROOT
 # =========================================================
@@ -76,7 +276,7 @@ def root():
     return {
         "system": "SCG Content Machine",
         "status": "ONLINE",
-        "version": "1.2.0"
+        "version": "1.3.0"
     }
 
 
@@ -91,13 +291,11 @@ def health():
 
     # PostgreSQL
     try:
-        database_url = os.getenv("DATABASE_URL")
-
-        if not database_url:
+        if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL is missing")
 
         with psycopg.connect(
-            database_url,
+            DATABASE_URL,
             connect_timeout=5
         ) as conn:
 
@@ -112,18 +310,8 @@ def health():
 
     # Redis
     try:
-        redis_url = os.getenv("REDIS_URL")
-
-        if not redis_url:
-            raise RuntimeError("REDIS_URL is missing")
-
-        redis_client = redis.from_url(
-            redis_url,
-            socket_connect_timeout=5,
-            socket_timeout=5
-        )
-
-        redis_client.ping()
+        client = get_redis()
+        client.ping()
 
         redis_status = "connected"
 
@@ -138,7 +326,7 @@ def health():
     payload = {
         "status": "healthy" if healthy else "unhealthy",
         "service": "content-machine",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "database": database_status,
         "redis": redis_status
     }
@@ -197,6 +385,9 @@ async def telegram_webhook(
 
         if callback_id:
             answer_callback_query(callback_id)
+
+        if not callback_chat_id:
+            return {"ok": True}
 
 
         # -------------------------------------------------
@@ -343,6 +534,17 @@ async def telegram_webhook(
                 content_format = parts[2]
                 objective = parts[3]
 
+                # SAVE SESSION TO REDIS
+                save_session(
+                    callback_chat_id,
+                    {
+                        "brand": brand,
+                        "format": content_format,
+                        "objective": objective,
+                        "status": "WAITING_PHOTO"
+                    }
+                )
+
                 send_message(
                     callback_chat_id,
                     "✅ Brief konten berhasil dibuat.\n\n"
@@ -379,6 +581,9 @@ async def telegram_webhook(
 
     if text == "/start":
 
+        # Reset unfinished session
+        delete_session(chat_id)
+
         brand_keyboard = {
             "inline_keyboard": [
                 [
@@ -402,6 +607,119 @@ async def telegram_webhook(
         )
 
         return {"ok": True}
+
+
+    # =====================================================
+    # PHOTO RECEIVED
+    # =====================================================
+
+    photos = message.get("photo")
+
+    if photos:
+
+        session = get_session(chat_id)
+
+        if not session:
+
+            send_message(
+                chat_id,
+                "⚠️ Brief konten tidak ditemukan atau sudah kedaluwarsa.\n\n"
+                "Ketik /start untuk membuat brief baru."
+            )
+
+            return {"ok": True}
+
+        if session.get("status") != "WAITING_PHOTO":
+
+            send_message(
+                chat_id,
+                "⚠️ Sistem belum menunggu foto.\n\n"
+                "Ketik /start untuk memulai ulang."
+            )
+
+            return {"ok": True}
+
+        # Telegram sends several image sizes.
+        # Last item is normally the highest resolution.
+        photo = photos[-1]
+
+        telegram_file_id = photo.get("file_id")
+        telegram_file_unique_id = photo.get("file_unique_id")
+
+        if not telegram_file_id:
+
+            send_message(
+                chat_id,
+                "❌ File foto tidak valid. Silakan kirim ulang."
+            )
+
+            return {"ok": True}
+
+        try:
+
+            telegram_file = get_telegram_file(
+                telegram_file_id
+            )
+
+            telegram_file_path = telegram_file.get(
+                "file_path"
+            )
+
+            if not telegram_file_path:
+                raise RuntimeError(
+                    "Telegram file_path is missing"
+                )
+
+            job_id, created = create_job_and_asset(
+                chat_id=chat_id,
+                message_id=message.get("message_id"),
+                brand=session["brand"],
+                content_format=session["format"],
+                objective=session["objective"],
+                telegram_file_id=telegram_file_id,
+                telegram_file_unique_id=telegram_file_unique_id,
+                telegram_file_path=telegram_file_path
+            )
+
+            if created:
+
+                send_message(
+                    chat_id,
+                    "✅ Foto berhasil diterima.\n\n"
+                    f"🆔 Job: {job_id}\n"
+                    f"🏷 Brand: {session['brand']}\n"
+                    f"🖼 Format: {session['format']}\n"
+                    f"🎯 Objective: {session['objective']}\n\n"
+                    "🧠 Foto sudah masuk ke sistem Content Machine."
+                )
+
+                delete_session(chat_id)
+
+            else:
+
+                send_message(
+                    chat_id,
+                    "ℹ️ Foto ini sudah pernah diterima.\n\n"
+                    f"🆔 Job: {job_id}"
+                )
+
+            return {"ok": True}
+
+        except Exception as exc:
+
+            print(
+                "PHOTO PROCESSING ERROR:",
+                repr(exc)
+            )
+
+            send_message(
+                chat_id,
+                "❌ Foto diterima Telegram, tetapi gagal dimasukkan "
+                "ke Content Machine.\n\n"
+                "Silakan coba lagi beberapa saat."
+            )
+
+            return {"ok": True}
 
 
     # -----------------------------------------------------
